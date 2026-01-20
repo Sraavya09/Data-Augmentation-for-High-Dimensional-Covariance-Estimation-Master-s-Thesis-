@@ -1,0 +1,3020 @@
+#===============================================================================
+# MASTER'S THESIS: Data Augmentation for High-Dimensional Covariance Estimation
+# ==============================================================================
+#
+#
+# Name: Sraavya Yagnamurthy
+# Supervisor: Dr. Bernhard Lutz
+# Date: 22.05.2025
+# Institution: University of Freiburg
+# Matriculation Number: 5576385
+# =========================================================================
+
+# Import necessary libraries
+import numpy as np  # For numerical operations
+import pandas as pd  # For data manipulation and analysis
+from sklearn.linear_model import LinearRegression  # For linear regression modeling
+import matplotlib.pyplot as plt  # For plotting and visualization
+import logging  # For logging errors and warnings
+import os  # For file and directory operations
+from pathlib import Path  # For handling file paths
+import sys  # For system-specific parameters and functions
+import seaborn as sns # For heatmap visualization
+import warnings # For handling warnings
+
+# Suppress specific warnings
+warnings.filterwarnings('ignore', message='invalid value encountered in divide')
+warnings.filterwarnings('ignore', message='invalid value encountered in true_divide')
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy.lib._function_base_impl')
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy.lib.function_base')
+
+# Configure logging to display messages in the console 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+##### Functions for loading, cleaning, and preparing return data #####
+
+# Function to load and process stock price data from a CSV file
+def load_csv_data(file_path: str) -> pd.DataFrame:
+    """
+    Load stock price data from a CSV file, process it, and calculate returns.
+
+    Steps:
+    1. Read the CSV file with specific parsing parameters.
+    2. Sort the data by date in ascending order.
+    3. Convert numeric columns to float, handling errors.
+    4. Calculate percentage returns for each stock.
+    5. Handle missing or invalid data.
+
+    Parameters:
+    - file_path: Path to the CSV file.
+
+    Returns:
+    - A DataFrame containing the returns data with stock tickers as columns.
+    """
+    try:
+        # Read the file with specific parsing parameters
+        df = pd.read_csv(
+            file_path, 
+            header=2,              # Use the third row as headers
+            index_col=0,           # Use the first column as the index (dates)
+            parse_dates=True,      # Parse the index as datetime objects
+            dayfirst=True,         # Assume dates are in DD.MM.YYYY format
+            decimal='.',           # Use '.' as the decimal separator
+            thousands=None,        # No thousands separator
+            low_memory=False,      # Avoid memory optimization for mixed types
+            dtype=str              # Read all columns as strings initially
+        )
+        
+        # Debugging: Print the raw data (first 5 rows)
+        print("Raw data (first 5 rows):")
+        print(df.head())
+        
+        # Ensure the DataFrame is not empty
+        if df.empty:
+            raise ValueError("The loaded DataFrame is empty. Please check the CSV file.")
+        
+        # Sort the data by date in ascending order
+        df = df.sort_index(ascending=True)
+        
+        # Debugging: Print the sorted data (first 5 rows)
+        print("Sorted data (first 5 rows):")
+        print(df.head())
+        
+        # Convert all columns to numeric, coercing errors to NaN
+        numeric_columns = df.columns  # Get all column names
+        df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors='coerce')
+
+        # Debugging: Print the numeric data after conversion to verify the transformation
+        print("Numeric data (first 5 rows):")
+        print(df.head())
+
+        # Debugging: Print the first 5 columns of the DataFrame to verify closing prices
+        print("Closing prices (first 5 rows):")
+        print(df.iloc[:, :5])
+
+        # Calculate percentage returns for each column (stock)
+        # This computes the percentage change between consecutive rows
+        returns = df.pct_change(fill_method=None)
+
+        # Drop the first row since it will contain NaN values after pct_change
+        returns = returns.iloc[1:]
+
+        # Remove columns where all values are NaN (e.g., stocks with no valid data)
+        returns = returns.dropna(axis=1, how='all')
+
+        # Debugging: Inspect the processed returns DataFrame
+        print("Returns DataFrame (first 5 rows):")
+        print(returns.head())
+
+        # Debugging: Display summary statistics of the returns DataFrame
+        print("Returns DataFrame statistics:")
+        print(returns.describe())
+
+        # Return the processed returns DataFrame for further analysis
+        return returns
+    
+    except Exception as e:
+        # Log any errors encountered during the process
+        logging.error(f"Error loading data: {e}", exc_info=True)
+        return pd.DataFrame()  # Return an empty DataFrame in case of error
+    
+
+# Function to augment data for assets with short history using linear regression
+def augment_data_for_short_history_assets(data, method='robust'):
+    """
+    Fills in missing data for assets with short history using the regression approach from the paper.
+    
+    Parameters:
+    - data: DataFrame with missing values
+    - method: Augmentation method ('robust' uses paper's regression, 'simple' uses mean)
+    
+    Returns:
+    - Augmented DataFrame with missing values filled
+    """
+    # First check NaN percentage
+    nan_percentage = data.isna().sum().sum() / data.size
+    
+    # For extreme cases, still use simple mean imputation
+    if nan_percentage > 0.7:  # More conservative threshold
+        print(f"Warning: Extremely high missing data ratio ({nan_percentage:.2%}). Using simple mean imputation.")
+        return data.fillna(data.mean())
+    
+    if method == 'simple':
+        # Simple method: Use mean values
+        return data.fillna(data.mean())
+    
+    # Paper's regression-based method (Equations 29-32)
+    augmented_data = data.copy()
+    
+    # For each asset with missing values
+    assets_with_na = data.columns[data.isna().any()]
+    assets_without_na = data.columns[~data.isna().any()]
+    
+    if len(assets_without_na) == 0:
+        # If all assets have some NAs, fill with column means
+        print("Warning: All assets have missing values. Using column means.")
+        return data.fillna(data.mean())
+    
+    # Calculate market return (mean of assets without missing data)
+    # This is X̄_t in Equation 29
+    market_return = data[assets_without_na].mean(axis=1)
+    
+    for asset in assets_with_na:
+        # Get non-missing values for this asset
+        mask = ~data[asset].isna()
+        
+        if mask.sum() < 10:  # Need at least 10 data points for regression
+            # Use mean value for the asset if insufficient data
+            augmented_data[asset] = augmented_data[asset].fillna(data[asset].mean())
+            continue
+        
+        try:
+            # Fit regression model (Equation 29): X_i,t = α_i + β_i * X̄_t + ε_i,t
+            X = market_return[mask].values.reshape(-1, 1)
+            y = data.loc[mask, asset].values
+            
+            # Use sklearn's LinearRegression for OLS
+            model = LinearRegression()
+            model.fit(X, y)
+            
+            # Extract coefficients
+            alpha_i = model.intercept_  # α_i
+            beta_i = model.coef_[0]     # β_i
+            
+            # Calculate residual standard deviation (Equation 30)
+            residuals = y - model.predict(X)
+            sigma_i = np.sqrt(np.mean(residuals**2))
+            
+            # Calculate correlation coefficient (Equation 31)
+            rho_i = np.corrcoef(market_return[mask], y)[0, 1]
+            if np.isnan(rho_i):
+                rho_i = 0.0
+            
+            # Predict missing values (Equation 32)
+            missing_mask = data[asset].isna()
+            n_missing = missing_mask.sum()
+            
+            if n_missing > 0:
+                # Get market returns for missing periods
+                market_missing = market_return[missing_mask].values
+                
+                # Generate random noise scaled by correlation
+                np.random.seed(42)  # For reproducibility
+                noise = rho_i * np.random.normal(0, sigma_i, size=n_missing)
+                
+                # Apply the formula: X̂_i,t = α_i + β_i * X̄_t + ρ_i * N(0, σ_i)
+                predicted_values = alpha_i + beta_i * market_missing + noise
+                
+                augmented_data.loc[missing_mask, asset] = predicted_values
+                
+        except Exception as e:
+            # Fallback to mean values if regression fails
+            print(f"  Regression failed for {asset}: {e}. Using mean values.")
+            augmented_data[asset] = augmented_data[asset].fillna(data[asset].mean())
+    
+    # Check if any NaNs remain
+    if augmented_data.isna().any().any():
+        # Fill any remaining NaNs with column means
+        augmented_data = augmented_data.fillna(data.mean())
+    
+    return augmented_data
+
+##### All covariance estimation methods #####
+
+# Function to estimate covariance matrix using different methods
+def estimate_covariance(returns: pd.DataFrame, method: str) -> np.ndarray:
+    """
+    Estimate the covariance matrix using the specified method.
+    
+    Parameters:
+    - returns: DataFrame of asset returns.
+    - method: Covariance estimation method.
+    
+    Returns:
+    - Covariance matrix as a NumPy array.
+    """
+    if returns.empty:
+        logging.error("Returns DataFrame is empty. Cannot estimate covariance.")
+        return np.array([])
+    
+    # Use distinct implementations for each method
+    try:
+        if method == 'Sample':
+            cov_matrix = _sample_covariance(returns.values)
+        elif method == 'LShri':
+            cov_matrix = _linear_shrinkage_identity(returns.values)
+        elif method == 'LShriCC':
+            cov_matrix = _linear_shrinkage_constant_correlation(returns.values)
+        elif method == 'DK':
+            cov_matrix = _dk_covariance(returns.values)  # Use the distinct DK method
+        elif method == 'POET':
+            cov_matrix = _poet_covariance(returns.values, q=None)
+        elif method == 'BPSEst':
+            cov_matrix = _bodnar_parolya_schmid_covariance(returns.values)
+        elif method == 'QIS':
+            # No need to demean returns again - the qis_covariance function already does this
+            cov_matrix = qis_covariance(returns.values)
+        elif method == '1/N':
+            # Equal weights covariance (identity matrix scaled by average variance)
+            # Useful as a baseline comparison
+            n_assets = returns.shape[1]
+            avg_var = np.mean(np.var(returns.values, axis=0))
+            cov_matrix = np.eye(n_assets) * avg_var
+        else:
+            raise ValueError(f"Unknown covariance estimation method: {method}")
+    except Exception as e:
+        logging.error(f"Error in {method} covariance estimation: {e}")
+        # Fallback to sample covariance if method-specific estimation fails
+        cov_matrix = _sample_covariance(returns.values)
+    
+    # Ensure matrix is symmetric
+    cov_matrix = (cov_matrix + cov_matrix.T) / 2
+    
+    # Log the condition number for debugging
+    try:
+        eigvals = np.linalg.eigvalsh(cov_matrix)
+        if np.min(eigvals) > 0:  # Avoid division by zero or negative values
+            condition_number = np.max(eigvals) / np.min(eigvals)
+            print(f"Method: {method}, Condition Number: {condition_number}")
+        else:
+            min_eig = np.min(eigvals)
+            print(f"Method: {method}, Matrix not positive definite. Min eigenvalue: {min_eig}")
+    except Exception as e:
+        logging.warning(f"Could not compute condition number for method {method}: {e}")
+    
+    return cov_matrix
+
+# Function to calculate the sample covariance matrix
+def _sample_covariance(X):
+    """
+    Calculate the standard sample covariance matrix.
+
+    Parameters:
+    - X: Input data (rows: observations, columns: variables).
+
+    Returns:
+    - Covariance matrix.
+    """
+    n, p = X.shape
+    X_centered = X - np.mean(X, axis=0)
+    return (X_centered.T @ X_centered) / n
+
+# Function to apply linear shrinkage to the identity matrix
+def _linear_shrinkage_identity(X):
+    """
+    Simple linear shrinkage to identity matrix as fallback for QIS.
+    
+    Parameters:
+    - X: Input data
+    
+    Returns:
+    - Shrunk covariance matrix
+    """
+    n, p = X.shape
+    
+    # Center the data
+    X_centered = X - np.mean(X, axis=0)
+    
+    # Sample covariance
+    S = (X_centered.T @ X_centered) / n
+    
+    # Simple shrinkage to identity
+    shrinkage_intensity = 0.5
+    target = np.eye(p) * np.mean(np.diag(S))
+    shrunk_cov = (1 - shrinkage_intensity) * S + shrinkage_intensity * target
+    
+    return shrunk_cov
+
+# Function to apply linear shrinkage to a constant correlation matrix
+def _linear_shrinkage_constant_correlation(R):
+    """
+    Ledoit-Wolf shrinkage toward constant correlation matrix.
+    """
+    T, N = R.shape
+    X = R - R.mean(axis=0)
+
+    sample_cov = (X.T @ X) / T
+
+    stddev = np.sqrt(np.diag(sample_cov))
+    corr = sample_cov / np.outer(stddev, stddev)
+
+    avg_corr = (np.sum(corr) - N) / (N * (N - 1))
+    prior = avg_corr * np.outer(stddev, stddev)
+    np.fill_diagonal(prior, np.diag(sample_cov))
+
+    # Compute phi
+    phi_mat = np.square(X.T @ X / T - sample_cov)
+    phi = np.sum(phi_mat)
+
+    # Compute rho
+    rho = np.sum(np.square(sample_cov - prior))
+
+    # Shrinkage intensity
+    shrinkage = phi / (phi + rho)
+    shrinkage = np.clip(shrinkage, 0, 1)
+
+    # Final estimator
+    shrunk_cov = shrinkage * prior + (1 - shrinkage) * sample_cov
+    return shrunk_cov
+
+# Function to apply direct kernel covariance estimation
+def _dk_covariance(X):
+    """
+    Direct Kernel (DK) estimator based on Ledoit & Wolf (2017a).
+    Analytical solution of QuEST function.
+    
+    Parameters:
+    - X: Input data
+    
+    Returns:
+    - Covariance matrix
+    """
+    n, p = X.shape
+    c = p/n  # Concentration ratio
+    
+    # Center the data
+    X_centered = X - np.mean(X, axis=0)
+    
+    # Calculate sample covariance
+    S = np.cov(X_centered, rowvar=False)
+    
+    # Perform eigendecomposition
+    eigenvals, eigenvecs = np.linalg.eigh(S)
+    
+    # Apply analytical nonlinear shrinkage formula
+    shrunk_eigenvals = np.zeros_like(eigenvals)
+    
+    if c < 1:  # Non-singular case
+        for i in range(p):
+            v = eigenvals[i]
+            # DK analytical formula 
+            if v > 0:
+                shrunk_eigenvals[i] = v / (1 - c - c*v*np.sum(1/(eigenvals - v + 1e-10))/p)
+            else:
+                shrunk_eigenvals[i] = v
+    else:  # Singular case
+        # Handle c ≥ 1 case (can't directly apply the formula)
+        non_zero_idx = eigenvals > 1e-10
+        non_zero_vals = eigenvals[non_zero_idx]
+        
+        for i in range(len(non_zero_vals)):
+            v = non_zero_vals[i]
+            # Modified formula for singular case
+            shrunk_eigenvals[non_zero_idx][i] = v / (1 - 1/c - v*np.sum(1/(non_zero_vals - v + 1e-10))/p)
+    
+    # Ensure positivity
+    shrunk_eigenvals = np.maximum(shrunk_eigenvals, 1e-10)
+    
+    # Reconstruct the covariance matrix
+    shrunk_cov = eigenvecs @ np.diag(shrunk_eigenvals) @ eigenvecs.T
+    
+    # Ensure symmetry
+    shrunk_cov = (shrunk_cov + shrunk_cov.T) / 2
+    
+    return shrunk_cov
+
+# Function to apply Principal Orhtogonal Complement Thresholding (POET)
+def _poet_covariance(X, q=None):
+    """
+    Principal Orthogonal complEment Thresholding (POET) with adaptive factor selection.
+    
+    Parameters:
+    - X: Input data (n observations × p assets)
+    - q: Number of principal components (if None, determined adaptively)
+    
+    Returns:
+    - Covariance matrix (p × p)
+    """
+    n, p = X.shape
+
+    # Center the data
+    X_centered = X - np.mean(X, axis=0)
+
+    # Sample covariance
+    sample_cov = np.cov(X_centered, rowvar=False)
+
+    # Eigenvalue method to choose q if not provided
+    if q is None:
+        eigenvals = np.linalg.eigvalsh(sample_cov)[::-1]  # descending
+        ratios = eigenvals[:-1] / (eigenvals[1:] + 1e-10)
+        q = min(np.argmax(ratios) + 1, int(np.sqrt(p)), int(n / 4))
+        q = max(q, 1)
+    else:
+        q = min(q, p - 1, n - 1)
+
+    # SVD for PCA
+    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+    factors = U[:, :q] * S[:q] / np.sqrt(n)  # (n × q)
+    loadings = Vt[:q, :].T * np.sqrt(n)      # (p × q)
+
+    # Low-rank approximation (n × p)
+    low_rank = factors @ loadings.T
+
+    # Residuals
+    residuals = X_centered - low_rank
+
+    # Residual covariance
+    residual_cov = np.cov(residuals, rowvar=False)
+
+    # Adaptive thresholding
+    residual_std = np.sqrt(np.diag(residual_cov))
+    residual_std[residual_std < 1e-8] = 1e-8  # Prevent division by zero
+    residual_corr = residual_cov / (residual_std[:, None] @ residual_std[None, :])
+    
+    threshold_val = np.sqrt(np.log(p) / n)
+    residual_corr_thresh = np.copy(residual_corr)
+    
+    for i in range(p):
+        for j in range(p):
+            if i != j:
+                if abs(residual_corr[i, j]) <= threshold_val:
+                    residual_corr_thresh[i, j] = 0
+                else:
+                    residual_corr_thresh[i, j] = np.sign(residual_corr[i, j]) * (abs(residual_corr[i, j]) - threshold_val)
+    
+    # Convert back to covariance
+    residual_cov_thresh = residual_corr_thresh * (residual_std[:, None] @ residual_std[None, :])
+
+    # Ensure positive definiteness
+    min_eig = np.min(np.linalg.eigvalsh(residual_cov_thresh))
+    if min_eig < 1e-6:
+        residual_cov_thresh += (abs(min_eig) + 1e-6) * np.eye(p)
+
+    # Final POET covariance
+    factor_cov = loadings @ loadings.T / n
+    poet_cov = factor_cov + residual_cov_thresh
+
+    return poet_cov
+
+# Function to apply Bodnar-Parolya-Schmid covariance estimation
+def _bodnar_parolya_schmid_covariance(X):
+    """
+    Bodnar-Parolya-Schmid Estimator: Generalized version of (Frahm & Memmel, 2010).
+    
+    Parameters: 
+    - X: Input data (rows: observations, columns: variables).
+    
+    Returns:
+    - Covariance matrix.
+    """
+    n, p = X.shape
+    
+    # Center the data
+    X_centered = X - np.mean(X, axis=0)
+    
+    # Compute sample covariance matrix
+    sample_cov = (X_centered.T @ X_centered) / n
+    
+    # Squared Frobenius norm of sample covariance
+    frob_norm_sq = np.sum(sample_cov**2)
+    
+    # Shrinkage intensity - using a unique formula for this method
+    delta = ((n - 2) / (n * (p + 1) * frob_norm_sq)) * np.trace(sample_cov)**2
+    delta = min(1, max(0, delta))  # Bound between 0 and 1
+    
+    # Shrinkage target - diagonal matrix with average variance
+    target = np.eye(p) * (np.trace(sample_cov) / p)
+    
+    # Compute shrinkage estimator
+    bps_cov = (1 - delta) * sample_cov + delta * target
+    
+    # Ensure symmetry
+    return (bps_cov + bps_cov.T) / 2
+
+# Function to apply Quadratic-Inverse Shrinkage (QIS) covariance estimation
+def qis_covariance(X):
+    """
+    Enhanced implementation of Quadratic-Inverse Shrinkage (QIS) with improved numerical stability.
+    
+    Parameters:
+    - X: Input data (rows: observations, columns: variables)
+    
+    Returns:
+    - Shrunk covariance matrix
+    """
+    n, p = X.shape
+    c = p/n  # Concentration ratio
+    
+    # Center the data
+    X_centered = X - np.mean(X, axis=0)
+    
+    # Sample covariance matrix (scale by n, not n-1)
+    S = (X_centered.T @ X_centered) / n
+    
+    try:
+        # Compute eigendecomposition with more stable algorithm
+        eigenvals, eigenvecs = np.linalg.eigh(S)
+        
+        # Ensure non-negative eigenvalues
+        eigenvals = np.maximum(eigenvals, 0)  
+        
+        # Avoid working too close to c = 1 where formulas become unstable
+        if 0.95 < c < 1.05:
+            # For c very close to 1, use a hybrid approach
+            c_effective = 0.95 if c < 1 else 1.05
+            print(f"Adjusting concentration ratio from {c:.4f} to {c_effective:.4f} for numerical stability")
+            c = c_effective
+        
+        # Apply QIS formula with safeguards
+        shrunk_eigenvals = np.zeros_like(eigenvals)
+        
+        if c < 1:  # Non-singular case
+            # Use a safer shrinkage intensity formula
+            h = min(0.8, c)  # Avoid shrinkage too close to 1
+            
+            # Calculate mean eigenvalue with protection against extreme values
+            mean_eigenval = np.mean(eigenvals)
+            if mean_eigenval < 1e-10:
+                mean_eigenval = 1e-10  # Avoid division by near-zero
+            
+            for i in range(p):
+                lambda_i = eigenvals[i]
+                if lambda_i > 0:
+                    # Apply formula with safeguards
+                    denominator = 1 - h + h * (lambda_i / mean_eigenval)
+                    
+                    # Avoid near-zero denominators
+                    if abs(denominator) < 1e-8:
+                        denominator = 1e-8 if denominator >= 0 else -1e-8
+                    
+                    shrunk_eigenvals[i] = lambda_i / denominator
+                else:
+                    shrunk_eigenvals[i] = lambda_i
+        else:  # Singular case (c >= 1)
+            # Handle singular case more carefully
+            nonzero_mask = eigenvals > 1e-10
+            nonzero_vals = eigenvals[nonzero_mask]
+            
+            if len(nonzero_vals) > 0:
+                mean_nonzero = np.mean(nonzero_vals)
+                h = 0.8  # Safer shrinkage for singular case
+                
+                # Apply modified formula for singular case
+                for i in range(p):
+                    if eigenvals[i] > 1e-10:
+                        denominator = 1 - h + h * (eigenvals[i] / mean_nonzero)
+                        
+                        # Protect against near-zero denominators
+                        if abs(denominator) < 1e-8:
+                            denominator = 1e-8 if denominator >= 0 else -1e-8
+                            
+                        shrunk_eigenvals[i] = eigenvals[i] / denominator
+        
+        # Ensure minimum eigenvalue for stability
+        shrunk_eigenvals = np.maximum(shrunk_eigenvals, 1e-8)
+        
+        # Reconstruct covariance matrix
+        shrunk_cov = eigenvecs @ np.diag(shrunk_eigenvals) @ eigenvecs.T
+        
+        # Ensure symmetry
+        shrunk_cov = (shrunk_cov + shrunk_cov.T) / 2
+        
+        # Calculate condition number (for reporting/debugging)
+        cond_num = np.max(shrunk_eigenvals) / np.min(shrunk_eigenvals)
+        print(f"Method: QIS, Condition Number: {cond_num}")
+        
+        # Check for NaN/Inf values as final safeguard
+        if np.isnan(shrunk_cov).any() or np.isinf(shrunk_cov).any():
+            print("Warning: QIS produced NaN/Inf values. Falling back to linear shrinkage.")
+            return _linear_shrinkage_identity(X)
+        
+        return shrunk_cov
+    
+    except Exception as e:
+        print(f"QIS eigendecomposition failed: {e}, using simple shrinkage")
+        # Fall back to simple linear shrinkage to identity
+        return _linear_shrinkage_identity(X)
+    
+
+# Add this function to implement the 1/N strategy
+def equal_weight_portfolio(returns_train):
+    """
+    Implements the 1/N equal-weight portfolio.
+    Allocates equal weight to each asset.
+    """
+    n_assets = returns_train.shape[1]
+    weights = np.ones(n_assets) / n_assets
+    return weights
+
+##### Portfolio construction and optimization #####
+
+# Function to optimize weights for the GMV portfolio
+def optimize_weights_robust(returns: pd.DataFrame, cov_matrix: np.ndarray):
+    """
+    GMV portfolio weight optimization with enhanced numerical stability.
+    
+    Parameters:
+    - returns: DataFrame of asset returns
+    - cov_matrix: Covariance matrix
+    
+    Returns:
+    - Portfolio weights as pandas Series with asset names as index
+    """
+    num_assets = cov_matrix.shape[0]
+    
+    # Check for NaN/Inf in covariance matrix
+    if np.isnan(cov_matrix).any() or np.isinf(cov_matrix).any():
+        print("Warning: NaN or Inf values in covariance matrix. Using equal weights.")
+        return pd.Series(np.ones(num_assets) / num_assets, index=returns.columns)
+    
+    # Apply improved regularization for numerical stability
+    cov_matrix = ensure_positive_definite(cov_matrix, min_eigenvalue=1e-5)
+    
+    try:
+        # Analytical GMV solution
+        ones = np.ones(num_assets)
+        inv_cov = np.linalg.inv(cov_matrix)
+        numerator = inv_cov @ ones
+        denominator = ones @ numerator
+        weights = numerator / denominator
+    
+    except Exception as e:
+        print(f"Optimization failed: {e}, using equal weights")
+        return pd.Series(np.ones(num_assets) / num_assets, index=returns.columns)
+    
+    # Check for valid weights
+    if not np.isfinite(weights).all() or np.abs(np.sum(weights) - 1.0) > 1e-6:
+        print("Invalid weights detected, using equal weights")
+        weights = np.ones(num_assets) / num_assets
+    
+    return pd.Series(weights, index=returns.columns)
+
+# Function to calculate the volatility difference between augmented and baseline portfolios
+def calculate_volatility_difference(baseline_returns, augmented_returns, scale="log", include_returns=False):
+    """
+    Calculate volatility difference with optional return difference calculation.
+    
+    Parameters:
+    - augmented_returns: Returns from low-dimensional portfolio
+    - baseline_returns: Returns from high-dimensional portfolio
+    - scale: Scaling method ("bp", "percent", "relative", or "log")
+    - include_returns: If True, also calculate return differences
+    
+    Returns:
+    - If include_returns=False: Scaled volatility difference (backward compatible)
+    - If include_returns=True: Dictionary with both volatility and return differences
+    """
+    # Check for empty return series
+    if len(augmented_returns) < 5 or len(baseline_returns) < 5:
+        return np.nan if not include_returns else {'vol_diff_bp': np.nan, 'return_diff_bp': np.nan}
+    
+    # Handle potential NaN values in returns
+    augmented_clean = augmented_returns.dropna()
+    baseline_clean = baseline_returns.dropna()
+    
+    if len(augmented_clean) < 5 or len(baseline_clean) < 5:
+        return np.nan if not include_returns else {'vol_diff_bp': np.nan, 'return_diff_bp': np.nan}
+    
+    try:
+        # Annualize volatilities with outlier trimming
+        augmented_vol = np.std(augmented_clean) * np.sqrt(252)
+        baseline_vol = np.std(baseline_clean) * np.sqrt(252)
+        
+        # Ensure minimum volatility to avoid division by zero
+        MIN_VOL = 0.001  # 0.1% minimum volatility
+        augmented_vol = max(augmented_vol, MIN_VOL)
+        baseline_vol = max(baseline_vol, MIN_VOL)
+        
+        # Calculate volatility difference
+        if scale == "bp":
+            # Basis points with capping to avoid extreme values
+            raw_diff = (augmented_vol - baseline_vol) * 10000
+            vol_diff = np.clip(raw_diff, -1000, 1000)  # Cap at ±1000 bp
+        elif scale == "percent":
+            # Percentage difference
+            vol_diff = ((augmented_vol - baseline_vol) / baseline_vol) * 100
+        elif scale == "relative":
+            # Ratio (1.0 means equal volatility)
+            vol_diff = augmented_vol / baseline_vol
+        elif scale == "log":
+            # Log ratio (more symmetrical around zero)
+            vol_diff = np.log(augmented_vol / baseline_vol) * 100
+        else:
+            raise ValueError(f"Unknown scaling method: {scale}")
+        
+        # If only volatility is needed (backward compatibility)
+        if not include_returns:
+            return vol_diff
+        
+        # Calculate return differences
+        augmented_return = np.prod(1 + augmented_clean) ** (252 / len(augmented_clean)) - 1
+        baseline_return = np.prod(1 + baseline_clean) ** (252 / len(baseline_clean)) - 1
+        
+        return_diff_bp = (augmented_return - baseline_return) * 10000  # In basis points
+        
+        risk_free_rate = 0.02  # Annual risk-free rate (2%)
+        # Add Sharpe ratio calculation for geometric returns:
+        baseline_sharpe = (baseline_return - risk_free_rate) / max(baseline_vol, 0.001)
+        augmented_sharpe = (augmented_return - risk_free_rate) / max(augmented_vol, 0.001)
+        sharpe_diff = augmented_sharpe - baseline_sharpe
+
+        # Add max drawdown calculations
+        aug_drawdown = calculate_max_drawdown(augmented_returns)
+        base_drawdown = calculate_max_drawdown(baseline_returns)
+
+        if not np.isnan(aug_drawdown) and not np.isnan(base_drawdown):
+        # Positive means augmented has lower drawdown (better)
+          drawdown_diff_pct = (base_drawdown - aug_drawdown) * 100
+        else:
+          drawdown_diff_pct = np.nan
+
+        
+        return {
+            'vol_diff_bp': vol_diff if scale == "bp" else (augmented_vol - baseline_vol) * 10000,
+            'return_diff_bp': return_diff_bp,
+            'sharpe_diff': sharpe_diff,
+            'augmented_vol': augmented_vol,
+            'baseline_vol': baseline_vol,
+            'augmented_return': augmented_return,
+            'baseline_return': baseline_return,
+            'max_drawdown_diff_pct': drawdown_diff_pct,  
+            'augmented_max_drawdown': aug_drawdown,      
+            'baseline_max_drawdown': base_drawdown      
+        }
+    except Exception as e:
+        print(f"Error calculating performance difference: {e}")
+        return np.nan if not include_returns else {'vol_diff_bp': np.nan, 'return_diff_bp': np.nan}
+    
+# 16 Function to calculate comprehensive portfolio metrics
+def calculate_comprehensive_metrics(returns: pd.DataFrame, weights: np.ndarray, risk_free_rate: float = 0.02):
+    """
+    Calculate comprehensive portfolio metrics.
+
+    Parameters:
+    - returns: DataFrame of asset returns.
+    - weights: Portfolio weights.
+    - risk_free_rate: Risk-free rate for Sharpe ratio calculation.
+
+    Returns:
+    - Dictionary of portfolio metrics.
+    """
+    portfolio_returns = returns @ weights
+
+    cumulative_return = np.prod(1 + portfolio_returns) - 1
+    annualized_return = np.prod(1 + portfolio_returns) ** (252 / len(portfolio_returns)) - 1
+    volatility = np.std(portfolio_returns) * np.sqrt(252)
+    sharpe_ratio = ((np.mean(portfolio_returns) - risk_free_rate / 252) / np.std(portfolio_returns)) * np.sqrt(252)
+
+    # Max drawdown
+    equity_curve = np.cumprod(1 + portfolio_returns)
+    rolling_max = np.maximum.accumulate(equity_curve)
+    max_drawdown = np.max((rolling_max - equity_curve) / rolling_max)
+
+    return {
+        "cumulative_return": cumulative_return,
+        "annualized_return": annualized_return,
+        "annualized_volatility": volatility,
+        "sharpe_ratio": sharpe_ratio,
+        "max_drawdown": max_drawdown
+    }
+
+# Function to calculate maximum drawdown
+def calculate_max_drawdown(returns):
+    """Calculate maximum drawdown from a returns series."""
+    returns_clean = returns.dropna()
+    
+    if len(returns_clean) < 5:
+        return np.nan
+    
+    # CRITICAL FIX: Handle case where all returns might be identical
+    if returns_clean.nunique() <= 1:
+        return 0.0  # If all returns are the same, no drawdown
+    
+    # Calculate equity curve (cumulative returns)
+    equity_curve = np.cumprod(1 + returns_clean)
+    
+    # CRITICAL FIX: Handle edge cases where equity curve becomes problematic
+    if np.any(equity_curve <= 0) or np.any(~np.isfinite(equity_curve)):
+        return np.nan
+    
+    # Calculate rolling maximum
+    rolling_max = np.maximum.accumulate(equity_curve)
+    
+    # Calculate max drawdown with protection against division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        drawdowns = (rolling_max - equity_curve) / rolling_max
+        drawdowns = np.nan_to_num(drawdowns, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    max_drawdown = np.max(drawdowns)
+    
+    return max_drawdown
+
+def ensure_positive_definite(cov_matrix, min_eigenvalue=1e-5):
+    """
+    Ensure a covariance matrix is positive definite by adjusting eigenvalues.
+    Uses eigendecomposition for better numerical stability.
+    
+    Parameters:
+    - cov_matrix: Input covariance matrix
+    - min_eigenvalue: Minimum eigenvalue threshold
+    
+    Returns:
+    - Regularized positive definite covariance matrix
+    """
+    # Handle potential NaN values
+    if np.isnan(cov_matrix).any():
+        print("Warning: NaN values in covariance matrix")
+        # Replace NaNs with zeros
+        cov_matrix = np.nan_to_num(cov_matrix)
+    
+    # Ensure symmetry first
+    cov_matrix = (cov_matrix + cov_matrix.T) / 2
+    
+    try:
+        # Perform eigendecomposition
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+        
+        # Find eigenvalues below threshold
+        too_small = eigenvalues < min_eigenvalue
+        
+        # If any eigenvalues are too small, fix them
+        if np.any(too_small):
+            eigenvalues[too_small] = min_eigenvalue
+            
+            # Reconstruct matrix with adjusted eigenvalues
+            regularized_cov = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+            
+            # Ensure symmetry in output
+            regularized_cov = (regularized_cov + regularized_cov.T) / 2
+            return regularized_cov
+        
+        return cov_matrix
+    except Exception as e:
+        print(f"Error in eigendecomposition: {e}")
+        # Fallback to simple regularization
+        return cov_matrix + min_eigenvalue * np.eye(cov_matrix.shape[0])
+
+##### Functions for evaluation and simulation #####
+
+# Function to evaluate different covariance estimation methods
+def evaluate(returns: pd.DataFrame, folder_path: Path, round_num: int, d_value: float = 1.0):
+    """
+    Evaluate different covariance estimation methods using the full dataset,
+    and include a 1/N equal weight portfolio as baseline.
+    """
+
+    # Set random seed for reproducibility
+    np.random.seed(42 + round_num)
+
+    # Add 1/N to the methods list
+    methods = ['Sample', 'LShri', 'LShriCC', 'DK', 'POET', 'BPSEst', 'QIS', '1/N']
+    results = {}
+    
+    data = returns
+    
+    if data.empty:
+        return {}
+    
+    plt.figure(figsize=(10, 6))
+    
+    line_styles = {
+        'Sample': '-',
+        'LShri': '--',
+        'LShriCC': ':',
+        'DK': '-.',
+        'POET': (0, (3, 1, 1, 1)),
+        'BPSEst': (0, (5, 1)),
+        'QIS': (0, (1, 1)),
+        '1/N': (0, (5, 2, 1, 2))
+    }
+
+    colors = {
+        'Sample': 'blue',
+        'LShri': 'orange',
+        'LShriCC': 'green',
+        'DK': 'red',
+        'POET': 'purple',
+        'BPSEst': 'brown',
+        'QIS': 'magenta',
+        '1/N': 'black'
+    }
+    
+    for method in methods:
+        try:
+            # Handle 1/N method separately
+            if method == '1/N':
+                # Equal weight portfolio
+                weights = equal_weight_portfolio(data)
+            else:
+                # Important: Convert DataFrame to numpy array for covariance estimation
+                data_array = data.values
+                
+                # Estimate covariance using the specified method - explicitly call the right function
+                if method == 'Sample':
+                    cov = _sample_covariance(data_array)
+                elif method == 'LShri':
+                    cov = _linear_shrinkage_identity(data_array)
+                elif method == 'LShriCC':
+                    cov = _linear_shrinkage_constant_correlation(data_array)
+                elif method == 'DK':
+                    cov = _dk_covariance(data_array)
+                elif method == 'POET':
+                    cov = _poet_covariance(data_array)
+                elif method == 'BPSEst':
+                    cov = _bodnar_parolya_schmid_covariance(data_array)
+                elif method == 'QIS':
+                    cov = qis_covariance(data_array)
+                else:
+                    raise ValueError(f"Unknown method: {method}")
+                
+                # Add a debug print to verify different covariance matrices
+                print(f"Method: {method}, Condition Number: {np.linalg.cond(cov):.4f}")
+                
+                # Optimize weights
+                weights = optimize_weights_robust(data, cov)
+            
+            # Calculate portfolio returns using the same dataset
+            portfolio_returns = data @ weights
+            equity_curve = np.cumprod(1 + portfolio_returns)
+            smoothed_curve = pd.Series(equity_curve).rolling(window=5).mean()
+            
+            # Calculate performance metrics
+            results[method] = {
+                "annualized_volatility": np.std(portfolio_returns) * np.sqrt(252),
+                "annualized_return": np.prod(1 + portfolio_returns) ** (252 / len(portfolio_returns)) - 1,
+                "risk_adj_return": (np.mean(portfolio_returns) / np.std(portfolio_returns)) * np.sqrt(252),
+                "max_drawdown": np.max(np.maximum.accumulate(equity_curve) - equity_curve) / np.max(np.maximum.accumulate(equity_curve))
+            }
+            
+            # Debug print actual volatility with more decimal places
+            print(f"Method: {method}, Volatility: {results[method]['annualized_volatility']:.6f}, " 
+                  f"Return: {results[method]['annualized_return']:.6f}, "
+                  f"Sharpe: {results[method]['risk_adj_return']:.6f}")
+
+            plt.plot(smoothed_curve, label=method, linestyle=line_styles[method], color=colors[method], linewidth=2)
+        except Exception as e:
+            logging.error(f"Error in method {method}: {e}", exc_info=True)
+    
+    plt.xlabel("Time")
+    plt.ylabel("Equity Curve")
+    # CHANGE THIS LINE TO INCLUDE D VALUE:
+    plt.title(f"Equity Curve Comparison - Round {round_num}, D={d_value}")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.yscale('log')  # Logarithmic scale
+    
+    # CHANGE THIS LINE TO INCLUDE D VALUE:
+    plt.savefig(os.path.join(folder_path, f"equity_curve_round_{round_num}_D{d_value}.png"), dpi=300)
+    plt.close()
+    
+    return results
+
+# Modify evaluate_multiple_rounds_with_d_values to support all covariance methods
+def evaluate_multiple_rounds_with_d_values(
+    num_rounds: int, 
+    base_folder: str, 
+    file_path: str, 
+    d_star_values: list = [0.95, 1.05, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.5, 3.0, 4.0, 5.0],
+    # [1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.75, 3.0, 3.5, 4.0, 5.0], when baseline D is 1.5
+    m_ratio_values: list = None,
+    num_assets: int = 100, # Number of assets to select from 100, 200, 300. Mentioned as int to check results after every evaluation
+    cov_methods: list = None
+) -> pd.DataFrame:
+    
+    """
+    Enhanced implementation to test multiple D* values with improved numerical stability.
+    """
+    # Set global random seed for reproducibility
+    np.random.seed(42)
+    
+    # Set default to use all available covariance methods if none specified
+    if cov_methods is None:
+        cov_methods = ['QIS']  # Focus on QIS as in the paper
+    
+    # Default missing ratio values if not specified
+    if m_ratio_values is None:
+        m_ratio_values = [0, 0.01, 0.02, 0.03, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90] 
+         # Avoid exactly 0.5
+    
+    # Create output folders with proper error handling
+    plot_folder = Path(base_folder) / "plots_by_d_star_value" 
+    try:
+        plot_folder.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Could not create plot folder: {e}")
+        # Fallback to base folder
+        plot_folder = Path(base_folder)
+        
+    all_results = []
+    
+    # Load returns data
+    returns = load_csv_data(file_path)
+    if returns.empty:
+        print("Error: Could not load returns data.")
+        return pd.DataFrame()
+
+    # Fixed parameter baseline D value
+    base_d = 0.5 # or 1.5 
+    
+    # Print confirmation of D* values being evaluated
+    print(f"Will evaluate these D* values: {d_star_values}")
+    print(f"Will evaluate these missing ratios: {m_ratio_values}")
+    print(f"Using these covariance methods: {cov_methods}")
+    
+    # Create progress tracking
+    total_evaluations = len(d_star_values) * len(m_ratio_values) * num_rounds
+    completed = 0
+        
+    # For each missing data ratio
+    for m_ratio in m_ratio_values:
+        print(f"--- Missing-data fraction M = {m_ratio:.2f} ---")
+        
+        # Apply a small perturbation to avoid exactly 0.5
+        if abs(m_ratio - 0.5) < 1e-6:
+            perturbed_m_ratio = m_ratio + 0.01
+            print(f"   Perturbing M=0.5 to M={perturbed_m_ratio:.2f} for numerical stability")
+        else:
+            perturbed_m_ratio = m_ratio
+        
+        # For each D* value, run multiple rounds
+        for d_star in d_star_values:
+            d_results = []
+            print(f"Evaluating D* = {d_star:.2f}")
+            
+            # Create D*-specific folder with error handling
+            try:
+                d_folder = plot_folder / f"d_{d_star:.1f}"
+                d_folder.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                print(f"Warning: Could not create D* subfolder: {e}")
+                d_folder = plot_folder
+            
+            print(f"\n===== STARTING EVALUATION FOR D* = {d_star:.2f} =====")
+            
+            d_results = []  # Store results for this D* value
+            
+            for round_num in range(num_rounds):
+                completed += 1
+                print(f"Progress: {completed}/{total_evaluations} evaluations ({(completed/total_evaluations)*100:.1f}%)")
+                
+                try:
+                    print(f"  Round {round_num+1}/{num_rounds} for D* = {d_star:.2f}")
+                    
+                    # Set random seed for reproducibility (but different per round)
+                    np.random.seed(42 + round_num)
+                    
+                    # Randomly select assets with preference for those with fewer NaNs
+                    # Pure random selection (as per paper)
+                    available_assets = returns.columns.tolist()
+                    actual_num_assets = min(num_assets, len(available_assets))
+                    selected_assets = np.random.choice(available_assets, size=actual_num_assets, replace=False)
+                    round_returns = returns[selected_assets].copy()
+                    
+                    # Fill any existing NaNs in the dataset
+                    round_returns = round_returns.fillna(round_returns.mean())
+                    
+                    # Calculate window sizes
+                    base_window = int(base_d * actual_num_assets)  # T = D * N
+                    augmented_window = int(d_star * actual_num_assets)  # T* = D* * N
+                    
+                    print(f"    Base window size: {base_window}, High-dim window size: {augmented_window}")
+                    
+                    # Skip if we don't have enough data
+                    if augmented_window > len(round_returns):
+                        print(f"    Skipping D* = {d_star:.2f} in round {round_num+1} - insufficient data")
+                        continue
+                    
+                    # Create datasets with missing values
+                    baseline_data = round_returns.iloc[:base_window].copy()
+                    augmented_data = round_returns.iloc[:augmented_window].copy()
+                    
+                    # Randomly select assets to have missing data
+                    m_assets = int(actual_num_assets * perturbed_m_ratio)
+                    missing_assets = np.random.choice(round_returns.columns, size=m_assets, replace=False)
+                    
+                    # Create missing data pattern as described in the paper
+                    for asset in missing_assets:
+                        # Set all data beyond base window to NaN for these assets
+                        augmented_data.loc[augmented_data.index[base_window:], asset] = np.nan
+
+                    # Check for data quality issues
+                    nan_fraction = augmented_data.isna().sum().sum() / augmented_data.size
+                    print(f"    NaN fraction: {nan_fraction:.2%}")
+                    
+                    if nan_fraction > 0.5:  # Only warn, don't skip
+                        print(f"    Warning: High NaN ratio ({nan_fraction:.2%}) in dataset")
+                    
+                    # Apply robust data augmentation - uses your modified function
+                    augmented_data = augment_data_for_short_history_assets(augmented_data)
+                    
+                    # Check if augmentation succeeded
+                    if augmented_data.isna().sum().sum() > 0:
+                        print(f"    Failed to fill all NaNs. Skipping round {round_num+1}")
+                        continue
+                    
+                    # Try each covariance method
+                    for method in cov_methods:
+                        try:
+                            print(f"      Evaluating method: {method}")
+                            
+                            # Calculate covariance using paper-aligned approach
+                            augmented_cov = estimate_covariance(augmented_data, method)
+                            baseline_cov = estimate_covariance(baseline_data, method)
+                            
+                            # Apply additional regularization for numerical stability
+                            augmented_cov = ensure_positive_definite(augmented_cov)
+                            baseline_cov = ensure_positive_definite(baseline_cov)
+                            
+                            # Optimize weights using paper-aligned approach
+                            augmented_weights = optimize_weights_robust(augmented_data, augmented_cov)
+                            baseline_weights = optimize_weights_robust(baseline_data, baseline_cov)
+
+                            # Check portfolio weights
+                            if augmented_weights.isna().any() or baseline_weights.isna().any():
+                                print(f"      Invalid weights in round {round_num+1}, skipping")
+                                continue
+                            
+                            # Calculate out-of-sample metrics
+                            test_window = 63  # Use exactly 63 days (quarterly) as in paper
+                            if augmented_window + test_window > len(round_returns):
+                                test_window = min(63, len(round_returns) - augmented_window)
+                                if test_window < 20:  # Need at least 20 days
+                                    print(f"      Insufficient test data ({test_window} periods). Skipping.")
+                                    continue
+                                
+                            out_sample = round_returns.iloc[augmented_window:augmented_window+test_window]
+                            
+                            # Ensure common assets
+                            common_assets_augmented = [col for col in augmented_weights.index if col in out_sample.columns]
+                            common_assets_baseline = [col for col in baseline_weights.index if col in out_sample.columns]
+                            
+                            # Skip if not enough common assets
+                            if len(common_assets_augmented) < 10 or len(common_assets_baseline) < 10:
+                                print(f"      Not enough common assets for evaluation in round {round_num+1}")
+                                continue
+                            
+                            # Normalize weights
+                            augmented_weights_norm = augmented_weights[common_assets_augmented]
+                            augmented_weights_norm = augmented_weights_norm / augmented_weights_norm.sum()
+                            
+                            baseline_weights_norm = baseline_weights[common_assets_baseline]
+                            baseline_weights_norm = baseline_weights_norm / baseline_weights_norm.sum()
+                            
+                            # Calculate returns
+                            augmented_returns = out_sample[common_assets_augmented] @ augmented_weights_norm
+                            baseline_returns = out_sample[common_assets_baseline] @ baseline_weights_norm
+
+                            # ADD THESE DIAGNOSTIC LINES:
+                            print(f"    DEBUG: M={m_ratio:.2f}, D*={d_star:.2f}, Round={round_num+1}")
+                            print(f"    Aug returns: mean={augmented_returns.mean():.6f}, std={augmented_returns.std():.6f}")
+                            print(f"    Base returns: mean={baseline_returns.mean():.6f}, std={baseline_returns.std():.6f}")
+                            print(f"    Out-sample shape: {out_sample.shape}, start_idx={augmented_window}")
+                            print(f"    Weight sums: Aug={augmented_weights_norm.sum():.6f}, Base={baseline_weights_norm.sum():.6f}")
+                            
+                            # Calculate performance metrics once
+                            performance_metrics = calculate_volatility_difference(baseline_returns, augmented_returns, scale="bp", include_returns=True)
+                            vol_diff_bp = performance_metrics['vol_diff_bp']
+                            return_diff_bp = performance_metrics['return_diff_bp']
+                            
+                            # Calculate other scales manually (more efficient)
+                            aug_vol = performance_metrics['augmented_vol']
+                            base_vol = performance_metrics['baseline_vol']
+                            vol_diff_pct = ((base_vol - aug_vol) / aug_vol) * 100
+                            vol_ratio = base_vol / aug_vol
+                            vol_log = np.log(base_vol / aug_vol) * 100
+                            
+                            # Use values from performance_metrics (already calculated correctly)
+                            risk_free_rate = 0.02  # Annualized risk-free rate
+                            baseline_sharpe = (performance_metrics['baseline_return'] - risk_free_rate) / max(performance_metrics['baseline_vol'], 0.001)
+                            augmented_sharpe = (performance_metrics['augmented_return'] - risk_free_rate) / max(performance_metrics['augmented_vol'], 0.001)
+                            sharpe_diff = baseline_sharpe - augmented_sharpe
+                            
+                            # Calculate max drawdown (only once)
+                            augmented_cum = (1 + augmented_returns).cumprod()
+                            running_max = np.maximum.accumulate(augmented_cum)
+                            drawdowns = (running_max - augmented_cum) / running_max
+                            max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0
+                            
+                            # Check for extreme values and skip if detected
+                            if abs(vol_diff_bp) > 2000:
+                                print(f"      Warning: Extreme volatility difference ({vol_diff_bp:.1f} bp) detected. Skipping.")
+                                continue
+                                
+                            result = {
+                                "round": round_num + 1,
+                                "d_value": d_star,
+                                "M": m_ratio,  # Save original M ratio for consistency
+                                "num_assets": actual_num_assets,
+                                "method": method,
+                                "augmented_vol": performance_metrics['augmented_vol'],
+                                "baseline_vol": performance_metrics['baseline_vol'],
+                                "vol_diff_bp": vol_diff_bp,
+                                "vol_diff_pct": vol_diff_pct,
+                                "vol_ratio": vol_ratio,
+                                "vol_log": vol_log,
+                                "augmented_return": performance_metrics['augmented_return'],
+                                "baseline_return": performance_metrics['baseline_return'],
+                                "return_diff_bp": return_diff_bp,
+                                "sharpe_diff": sharpe_diff,
+                                "sharpe_ratio": augmented_sharpe,
+                                "risk": performance_metrics['augmented_vol'],
+                                "annualized_return": performance_metrics['augmented_return'],
+                                "max_drawdown": max_drawdown,
+                                "max_drawdown_diff_pct": performance_metrics['max_drawdown_diff_pct'],
+                                "augmented_max_drawdown": performance_metrics['augmented_max_drawdown'],
+                                "baseline_max_drawdown": performance_metrics['baseline_max_drawdown']
+                            }
+                            
+                            all_results.append(result)
+                            d_results.append(result)
+                            
+                            print(f"      D* = {d_star:.2f}, {method}: Volatility Diff = {vol_diff_bp:.2f} bp, Ratio = {vol_ratio:.2f}")
+                        
+                        except Exception as e:
+                            print(f"      Error in {method} evaluation (round {round_num+1}): {e}")
+                    
+                except Exception as e:
+                    print(f"    Error in round {round_num+1}: {e}")
+            
+            # Print results so far for this D* value
+            print(f"\nResults for D* = {d_star:.2f}: {len(d_results)} valid evaluations")
+            
+            # Save interim results for this D* value
+            if d_results:
+                d_results_df = pd.DataFrame(d_results)
+                # Use safe save method to avoid permission errors
+                try:
+                    filename = f"d_{d_star:.1f}_M{m_ratio:.2f}_results.csv"
+                    safe_save_csv(d_results_df,os.path.join(base_folder, filename))
+
+                except Exception as e:
+                    print(f"Warning: Could not save D* results: {e}")
+                
+                # Create D*-specific visualizations by method
+                try:
+                    # Use a more robust statistic (median) for summarizing results
+                    method_summary = d_results_df.groupby('method').agg({
+                        'vol_diff_bp': ['median', 'mean', 'std', 'count'],
+                        'vol_ratio': ['median', 'mean']
+                    }).reset_index()
+                    
+                    method_summary.columns = ['method', 'vol_diff_bp_median', 'vol_diff_bp_mean', 
+                                              'vol_diff_bp_std', 'count', 'vol_ratio_median', 'vol_ratio_mean']
+                    
+                    method_summary = method_summary.sort_values(by='vol_diff_bp_median')
+                    
+                    # Bar chart of methods for this D* value
+                    plt.figure(figsize=(12, 6))
+                    colors = {
+                        'Sample': 'blue',
+                        'LShri': 'orange',
+                        'LShriCC': 'green',
+                        'DK': 'red',
+                        'POET': 'purple',
+                        'BPSEst': 'brown',
+                        'QIS': 'magenta',
+                        '1/N': 'black'
+                    }
+                    
+                    plt.bar(
+                        range(len(method_summary)), 
+                        method_summary['vol_diff_bp_median'],  # Use median instead of mean
+                        yerr=method_summary['vol_diff_bp_std'],
+                        capsize=10,
+                        color=[colors.get(m, 'gray') for m in method_summary['method']],
+                        alpha=0.7
+                    )
+                    
+                    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+                    plt.xlabel('Method')
+                    plt.ylabel('Volatility Difference (bp)')
+                    plt.title(f'Method Comparison for D* = {d_star:.2f}')
+                    plt.xticks(range(len(method_summary)), method_summary['method'], rotation=45)
+                    plt.grid(axis='y', linestyle='--', alpha=0.3)
+                    
+                    # Add value labels
+                    for i, row in enumerate(method_summary.itertuples()):
+                        plt.text(
+                            i, row.vol_diff_bp_median + (row.vol_diff_bp_std if not np.isnan(row.vol_diff_bp_std) else 0), 
+                            f"{row.vol_diff_bp_median:.1f} bp\n(n={row.count})", 
+                            ha='center', va='bottom'
+                        )
+                    
+                    plt.tight_layout()
+                    
+                    # Save figure with safe handling
+                    try:
+                        plt.savefig(os.path.join(d_folder, f"method_comparison.png"), dpi=300)
+                    except Exception as e:
+                        print(f"Warning: Could not save method comparison plot: {e}")
+                        # Try alternative location
+                        try:
+                            plt.savefig(os.path.join(base_folder, f"method_comparison_d_{d_star:.1f}.png"), dpi=300)
+                        except:
+                            pass
+                            
+                    plt.close()
+                    
+                    # Save method summary to CSV
+                    try:
+                        filename = f"method_summary_d_{d_star:.1f}_M{m_ratio:.2f}.csv"
+                        safe_save_csv(method_summary,os.path.join(d_folder, filename))
+
+                    except Exception as e:
+                        print(f"Warning: Could not save method summary: {e}")
+                    
+                except Exception as e:
+                    print(f"Error creating visualization for D* = {d_star:.2f}: {e}")
+    
+    # Create results DataFrame
+    results_df = pd.DataFrame(all_results)
+    
+    # Filter out any remaining extreme values
+    if not results_df.empty:
+        # Identify extreme outliers using quantiles
+        q1 = results_df['vol_diff_bp'].quantile(0.25)
+        q3 = results_df['vol_diff_bp'].quantile(0.75)
+        iqr = q3 - q1
+        lower_bound = q1 - 3 * iqr
+        upper_bound = q3 + 3 * iqr
+        
+        # Create a filtered dataframe removing extreme outliers
+        filtered_df = results_df[
+            (results_df['vol_diff_bp'] >= lower_bound) & 
+            (results_df['vol_diff_bp'] <= upper_bound)
+        ]
+        
+        # If filtering removed a significant number of points, log it
+        if len(filtered_df) < 0.9 * len(results_df):
+            print(f"Warning: Removed {len(results_df) - len(filtered_df)} extreme outliers")
+            print(f"Original range: [{results_df['vol_diff_bp'].min()}, {results_df['vol_diff_bp'].max()}]")
+            print(f"Filtered range: [{filtered_df['vol_diff_bp'].min()}, {filtered_df['vol_diff_bp'].max()}]")
+        
+        # Use the filtered dataframe for analysis
+        results_df = filtered_df
+    
+    # Save results with safe error handling
+    if not results_df.empty:
+        try:
+            # Use safe save methods
+            results_file = os.path.join(base_folder,f"d_{d_star:.1f}_M{m_ratio:.2f}_d_star_value_evaluation_results.csv")
+            safe_save_csv(results_df, results_file)
+ 
+            eval_file = os.path.join(base_folder,f"d_{d_star:.1f}_M{m_ratio:.2f}_evaluation_results.csv")
+            safe_save_csv(results_df, eval_file)
+
+        except Exception as e:
+            print(f"Warning: Could not save final results: {e}")
+        
+        try:
+            # Generate improved table 4
+            generate_robust_table_4_from_results(results_df, base_folder)
+            generate_return_table_4_from_results(results_df, base_folder)
+            generate_sharpe_table_4_from_results(results_df, base_folder)
+            generate_max_drawdown_table_4_from_results(results_df, base_folder)  # Fixed: use base_folder not output_folder
+        except Exception as e:
+            print(f"Warning: Could not generate Table 4: {e}")
+        
+        # Create comprehensive D* comparison visualization by method
+        try:
+            plt.figure(figsize=(14, 10))
+            
+            # Group by D* value and method, calculate median volatility difference for robustness
+            d_method_results = results_df.groupby(['d_value', 'method'])['vol_diff_bp'].median().reset_index()
+            
+            # Color palette
+            colors = {
+                'Sample': 'blue',
+                'LShri': 'orange',
+                'LShriCC': 'green',
+                'DK': 'red',
+                'POET': 'purple',
+                'BPSEst': 'brown',
+                'QIS': 'magenta',
+                '1/N': 'black'
+            }
+            
+            # For each method, plot performance across D* values
+            for method in d_method_results['method'].unique():
+                method_data = d_method_results[d_method_results['method'] == method]
+                plt.plot(
+                    method_data['d_value'], 
+                    method_data['vol_diff_bp'], 
+                    marker='o', 
+                    label=method, 
+                    linewidth=2,
+                    color=colors.get(method, 'gray')
+                )
+            
+            plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+            plt.xlabel('D* Value')
+            plt.ylabel('Volatility Difference (bp)')
+            plt.title('Median Volatility Difference by D* Value and Method')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            
+            # Save with error handling
+            try:
+                plt.savefig(os.path.join(base_folder, "d_star_method_comparison.png"), dpi=300)
+            except Exception as e:
+                print(f"Warning: Could not save method comparison plot: {e}")
+                
+            plt.close()
+        except Exception as e:
+            print(f"Error creating D* comparison visualization: {e}")
+    else:
+        print("Warning: No valid results generated!")
+        
+    # Convert collected results into a DataFrame and return
+    return results_df
+
+# Function to perform rolling-window evaluation with quarterly rebalancing
+def rolling_window_evaluation_quarterly(
+    returns: pd.DataFrame,
+    N: int = 100, # Number of assets to select from 100, 200, 300. Mentioned as int to check results after every evaluation
+    estimation_window: int = 252,   # trailing 252 days (approx 1 year)
+    rebalancing_interval: int = 63, # rebalance every 63 days (approx 3 months)
+    max_rebalances: int = 12,
+    cov_method: str = 'QIS'
+):
+    """
+    Perform a rolling-window evaluation with quarterly rebalancing,
+      1) Use a trailing 'estimation_window' of historical data
+         to estimate the covariance.
+      2) Compute weights from that covariance and hold them for
+         'rebalancing_interval' days out of sample.
+      3) Shift forward by 'rebalancing_interval' and repeat.
+
+    Parameters
+    ----------
+    returns : pd.DataFrame
+        Daily returns, rows = dates, columns = assets.
+    N : int
+        Number of assets for the portfolio (if returns has more than N columns,
+        we randomly choose N).
+    estimation_window : int
+        Number of days in each look-back window (252 ~ 1 year).
+    rebalancing_interval : int
+        How often (in trading days) we rebalance (21 ~ monthly).
+    max_rebalances : int
+        How many times we will shift and evaluate out-of-sample performance.
+    cov_method : str
+        Which covariance method to use (e.g., 'QIS', 'Sample', etc.).
+
+    Returns
+    -------
+    dict
+        Dictionary summarizing out-of-sample performance (annualized vol, etc.).
+    """
+    np.random.seed()  # For reproducibility
+
+    # Optionally limit to N assets
+    if returns.shape[1] > N:
+        selected = np.random.choice(returns.columns, N, replace=False)
+        returns = returns[selected]
+
+    # Keep track of each out-of-sample performance
+    realized_vols = []
+
+    t = 0
+    rebalance_count = 0
+    while True:
+        # Check that we can form a full estimation window
+        if t + estimation_window > len(returns):
+            break
+        # Also ensure we have at least one day of out-of-sample
+        if t + estimation_window + rebalancing_interval > len(returns):
+            break
+        # And stop if we exceed max_rebalances
+        if rebalance_count >= max_rebalances:
+            break
+
+        # 1) In-sample window for covariance
+        in_sample_data = returns.iloc[t : t + estimation_window]
+        # Estimate covariance
+        try:
+            cov = estimate_covariance(in_sample_data, cov_method)
+        except Exception as e:
+            logging.warning(f"Covariance estimation failed at t={t}: {e}")
+            break
+
+        # 2) Compute portfolio weights (GMV in this example)
+        try:
+            w = optimize_weights_robust(in_sample_data, cov)
+        except Exception as e:
+            logging.warning(f"Weight optimization failed at t={t}: {e}")
+            break
+
+        # 3) Out-of-sample interval
+        out_sample_data = returns.iloc[t + estimation_window : t + estimation_window + rebalancing_interval]
+        if len(out_sample_data) == 0:
+            break
+
+        # Portfolio returns over the out-of-sample interval
+        port_ret = out_sample_data.values @ w
+
+        # Compute realized volatility, annualized
+        realized_vol = np.std(port_ret) * np.sqrt(252)
+        realized_vols.append(realized_vol)
+
+        # Move forward by rebalancing_interval
+        t += rebalancing_interval
+        rebalance_count += 1
+
+    results = {
+        "mean_annualized_vol": np.mean(realized_vols) if realized_vols else np.nan,
+        "std_annualized_vol":  np.std(realized_vols)  if realized_vols else np.nan,
+        "num_rebalances": rebalance_count
+    }
+    return results
+
+# Update cross_validate_optimal_dimension to use all methods by default
+def cross_validate_optimal_dimension(
+    original_returns: pd.DataFrame,
+    disjoint_data: pd.DataFrame,
+    N: int = 100, # Number of assets to select from 100, 200, 300. Mentioned as int to check results after every evaluation
+    T: int = None,
+    M_ratio: float = 0.05,
+    cov_method: str = 'QIS',
+    rebalancing_interval: int = 21,
+    dimension_search_space: list = None
+):
+    """
+    Find optimal dimension ratio using cross-validation on a disjoint dataset,
+    following Algorithm 1 from Mörstedt et al.
+    
+    Parameters:
+    - original_returns: DataFrame of asset returns for the actual problem.
+    - disjoint_data: Separate disjoint dataset for cross-validation.
+    - N: Number of assets.
+    - T: Original sample length (if None, calculated as int(D * N)).
+    - M_ratio: Ratio of assets with missing data.
+    - cov_method: Covariance estimation method.
+    - rebalancing_interval: Rebalancing interval (21 trading days = monthly).
+    - dimension_search_space: List of dimension ratios to evaluate.
+    
+    Returns:
+    - Optimal dimension ratio D*.
+    """
+    if dimension_search_space is None:
+        dimension_search_space = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 
+                                 1.75, 2.0, 2.25, 2.5, 3.0, 4.0, 5.0]
+    
+    # If T is not provided, calculate it based on original dimension ratio
+    if T is None:
+        D = original_returns.shape[0] / N
+        T = int(D * N)
+    
+    # Number of assets with short history
+    M = int(N * M_ratio)
+    
+    # Randomly select M assets to have short history in the disjoint dataset
+    np.random.seed(42)  # For reproducibility
+    all_assets = disjoint_data.columns.tolist()
+    M_assets = np.random.choice(all_assets, size=min(M, len(all_assets)), replace=False).tolist()
+    N_M_assets = [asset for asset in all_assets if asset not in M_assets][:N-M]
+    
+    # Keep track of the best dimension
+    best_dimension = None
+    best_volatility = float('inf')
+    
+    # Maximum dimension to test (avoid going beyond the disjoint dataset length)
+    max_dimension = min(max(dimension_search_space), disjoint_data.shape[0] / N)
+    K = disjoint_data.shape[0]  # Length of disjoint dataset
+    
+    # Evaluate each dimension ratio
+    for D_star in [d for d in dimension_search_space if d <= max_dimension]:
+        delta_T = int(D_star * N) - T
+        
+        if delta_T <= 0:
+            continue  # Skip if no data would be added
+        
+        # Rolling window evaluation
+        t = 0
+        n_CV = 0
+        total_risk = 0
+        
+        # Calculate how many evaluation windows we can have
+        # We need to ensure we can fit the full window of data
+        max_T_star = int(D_star * N)
+        max_delta_T = max_T_star - T
+        
+        while t + max_T_star + rebalancing_interval <= K:
+            # Create truncated dataset to mimic the original problem
+            V_CV = disjoint_data.iloc[t:t+max_T_star].copy()
+            
+            # Truncate M assets to original length T
+            for asset in M_assets:
+                if asset in V_CV.columns:
+                    V_CV.loc[V_CV.index[T:max_T_star], asset] = np.nan
+            
+            # Augment the data
+            augmented_data = augment_data_for_short_history_assets(V_CV)
+            
+            # Estimate covariance using the specified method
+            try:
+                cov_matrix = estimate_covariance(augmented_data, cov_method)
+                
+                # Optimize weights
+                weights = optimize_weights_robust(augmented_data, cov_matrix)
+                
+                # Calculate out-of-sample volatility on next trading period
+                out_sample = disjoint_data.iloc[t+max_T_star:t+max_T_star+rebalancing_interval]
+                if len(out_sample) > 0:
+                    portfolio_returns = out_sample[weights.index] @ weights
+                    period_volatility = np.std(portfolio_returns) * np.sqrt(252)  # Annualized
+                    total_risk += period_volatility
+                    n_CV += 1
+            except Exception as e:
+                print(f"Error evaluating D*={D_star}: {e}")
+            
+            # Move forward by rebalancing interval
+            t += rebalancing_interval
+        
+        # Calculate average volatility across all periods
+        if n_CV > 0:
+            avg_volatility = total_risk / n_CV
+            print(f"D*: {D_star:.2f}, Average Volatility: {avg_volatility:.6f}, Periods: {n_CV}")
+            
+            # Track best dimension
+            if avg_volatility < best_volatility:
+                best_volatility = avg_volatility
+                best_dimension = D_star
+    
+    if best_dimension is None:
+        # Fallback to a reasonable default if no valid evaluation was possible
+        best_dimension = 1.5
+        print(f"Warning: No valid evaluations completed. Using default D*={best_dimension}")
+    
+    return best_dimension
+
+# Function to run comprehensive analysis with all methods
+def run_comprehensive_analysis(
+    returns: pd.DataFrame,
+    N_values: list = [100, 200, 300],
+    D_values: list = [0.7, 0.9, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 4.0, 5.0],
+    M_ratio_values: list = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90],
+    cov_methods: list = ['QIS', 'LShri', 'LShriCC', 'DK', 'POET'],
+    window_size: int = 63
+) -> pd.DataFrame:
+    """
+    Comprehensive analysis of data augmentation and covariance estimation.
+    
+    Parameters:
+    - returns: DataFrame of asset returns
+    - N_values: List of asset numbers to test
+    - D_values: List of dimension ratios
+    - M_ratio_values: List of missing data ratios
+    - cov_methods: List of covariance estimation methods
+    - window_size: Size of evaluation window in days
+    
+    Returns:
+    - DataFrame of analysis results
+    """
+    results = []
+    
+    # Define N_values if not already defined
+    N_values = [100, 200, 300]  # Example values for the number of assets
+
+
+    for N in N_values:
+        # Randomly select subset of assets
+        subset_returns = returns.sample(n=min(N, len(returns.columns)), axis=1)
+        
+        for D in D_values:
+            # Define M_ratio_values if not already defined
+            M_ratio_values = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+            for M_ratio in M_ratio_values:
+                for cov_method in cov_methods:
+                    try:
+                        # Compare standard vs augmented approach
+                        evaluation_result = rolling_window_evaluation_quarterly(
+                            subset_returns,
+                            N=N,
+                            estimation_window=int(D * subset_returns.shape[0]),
+                            rebalancing_interval=window_size,
+                            cov_method=cov_method
+                        )
+                        
+                        results.append({
+                            'N': N,
+                            'D': D,
+                            'M_ratio': M_ratio,
+                            'cov_method': cov_method,
+                            'volatility_reduction_pct': evaluation_result.get('volatility_reduction_pct', np.nan)
+                        })
+                    except Exception as e:
+                        logging.error(f"Error in configuration N={N}, D={D}, M={M_ratio}, Method={cov_method}: {e}")
+    
+    results_df = pd.DataFrame(results)
+    return results_df
+
+##### Visualization and results formatting #####
+
+# Function to generate average performance plots
+def generate_average_plots(base_folder: str, num_assets: int = None):
+    """
+    Generate plots showing average performance metrics with improved asset handling.
+    If num_assets is None, automatically finds available asset sizes.
+    """
+    # Create summary folder
+    summary_folder = Path(base_folder) / "summary_plots"
+    summary_folder.mkdir(parents=True, exist_ok=True)
+
+    # Define metrics to plot
+    metrics = {
+        "sharpe_ratio": "Annualized Sharpe",
+        "annualized_return": "Annualized Return",
+        "risk": "Annualized Vol",
+        "max_drawdown": "Maximum Drawdown"
+    }
+
+    # Load evaluation results with robust error handling
+    csv_file = Path(base_folder) / "evaluation_results.csv"
+    
+    try:
+        # Try reading the CSV
+        df = pd.read_csv(csv_file)
+        
+        # If num_assets is None, find all available asset sizes 
+        if num_assets is None:
+            if 'num_assets' in df.columns:
+                asset_sizes = df['num_assets'].unique()
+                if len(asset_sizes) == 0:
+                    print("No asset sizes found in data")
+                    return
+            else:
+                print("'num_assets' column not found in data")
+                return
+        else:
+            # Filter for the requested asset size if it exists
+            if 'num_assets' in df.columns:
+                asset_sizes = df['num_assets'].unique()
+                if num_assets in asset_sizes:
+                    asset_sizes = [num_assets]
+                else:
+                    print(f"Asset size {num_assets} not found in data")
+                    if len(asset_sizes) > 0:
+                        print(f"Using available asset sizes: {asset_sizes}")
+                    else:
+                        print("No asset sizes found in data")
+                        return
+            else:
+                print("'num_assets' column not found in data")
+                return
+                
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return
+    
+    # For each available asset size
+    for asset_size in asset_sizes:
+        print(f"Creating plots for asset size: {asset_size}")
+        
+        # Filter data for this asset size
+        asset_df = df[df['num_assets'] == asset_size]
+        
+        if asset_df.empty:
+            print(f"No data for {asset_size} assets")
+            continue
+            
+        # Check if required columns exist
+        required_cols = ['method'] + list(metrics.keys())
+        missing_cols = [col for col in required_cols if col not in asset_df.columns]
+        if missing_cols:
+            print(f"Missing columns in results: {missing_cols}")
+            continue
+        
+        # Get unique methods
+        methods = asset_df['method'].unique()
+        if len(methods) == 0:
+            print(f"No methods found for asset size {asset_size}")
+            continue
+
+        # Define color palette
+        colors = {
+            'Sample': 'blue',
+            'LShri': 'orange',
+            'LShriCC': 'green',
+            'DK': 'red',
+            'POET': 'purple',
+            'BPSEst': 'brown',
+            'QIS': 'magenta',
+            '1/N': 'black'
+        }
+
+        # Create plot
+        plt.figure(figsize=(14, 10))
+
+        metric_count = 0
+        for metric_key, metric_name in metrics.items():
+            if metric_key not in asset_df.columns:
+                print(f"Metric {metric_key} not found in data")
+                continue
+                
+            metric_count += 1
+            if metric_count > 4:  # Limit to 4 subplots
+                break
+                
+            plt.subplot(2, 2, metric_count)
+
+            method_stats = []
+            for method in methods:
+                method_data = asset_df[asset_df['method'] == method][metric_key].dropna()
+                if len(method_data) > 0:
+                    mean_val = method_data.mean()
+                    std_val = method_data.std() if len(method_data) > 1 else 0
+                    method_stats.append((method, mean_val, std_val))
+
+            if not method_stats:
+                print(f"No valid data for metric {metric_name}")
+                continue
+                
+            # Sort methods by performance
+            if metric_key in ['annualized_return', 'sharpe_ratio']:
+                method_stats.sort(key=lambda x: x[1], reverse=True)
+            else:
+                method_stats.sort(key=lambda x: x[1])
+
+            # Prepare data for plotting
+            sorted_methods = [m[0] for m in method_stats]
+            mean_values = [m[1] for m in method_stats]
+            std_values = [m[2] for m in method_stats]
+            positions = np.arange(len(sorted_methods))
+
+            # Create bars
+            bars = plt.bar(
+                positions, mean_values,
+                yerr=std_values,
+                capsize=10,
+                color=[colors.get(m, 'gray') for m in sorted_methods],
+                alpha=0.7
+            )
+
+            # Add value labels
+            for i, (bar, val, std) in enumerate(zip(bars, mean_values, std_values)):
+                if metric_key in ['annualized_return', 'risk', 'max_drawdown']:
+                    label = f"{val:.2%}"
+                else:
+                    label = f"{val:.2f}"
+                plt.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + std * 0.5,
+                    label, ha='center', va='bottom', fontsize=9
+                )
+
+            plt.xlabel('Covariance Method')
+            plt.ylabel(metric_name)
+            plt.title(f'Average {metric_name} for N={asset_size}')
+            plt.xticks(positions, sorted_methods, rotation=15)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+        plt.tight_layout()
+        plt.savefig(summary_folder / f"performance_comparison_{asset_size}.png", dpi=300)
+        plt.close()
+        
+    print(f"Performance comparison plots saved to {summary_folder}")
+
+def generate_robust_table_4_from_results(results_df: pd.DataFrame, output_folder: str):
+    """
+    Generate Table 4 from evaluation results with baseline volatility column
+    and baseline-augmented volatility differences (positive values show reduction),
+    averaging across all rounds for each combination.
+    """
+    if results_df.empty:
+        print("No results available to generate Table 4")
+        return
+    
+    # Create output folder
+    table4_folder = os.path.join(output_folder, "table4_from_evaluation")
+    try:
+        os.makedirs(table4_folder, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Could not create Table 4 folder: {e}")
+        table4_folder = output_folder
+    
+    # Get all D* values and M values from results
+    d_star_values = sorted(results_df['d_value'].unique())
+    m_ratio_values = sorted(results_df['M'].unique())
+    
+    # Create tables
+    baseline_vol_by_m = pd.DataFrame(index=m_ratio_values, columns=['baseline_vol_mean', 'count'], dtype=float)
+    vol_diff_table = pd.DataFrame(0.0, index=m_ratio_values, columns=d_star_values, dtype=float)
+    count_table = pd.DataFrame(0, index=m_ratio_values, columns=d_star_values, dtype=int)
+    
+    # Calculate baseline volatility for each M ratio by averaging across all rounds
+    for m in m_ratio_values:
+        # Filter data for this specific M ratio
+        m_subset = results_df[results_df['M'] == m]
+        
+        # Verify we have data for this M ratio
+        if m_subset.empty:
+            print(f"Warning: No data found for M ratio {m}")
+            baseline_vol_by_m.loc[m, 'baseline_vol_mean'] = np.nan
+            baseline_vol_by_m.loc[m, 'count'] = 0
+            continue
+            
+        # Calculate baseline volatility by averaging across all available data for this M ratio
+        if 'baseline_vol' in m_subset.columns:
+            valid_vols = m_subset['baseline_vol'].dropna()
+            if not valid_vols.empty:
+                # Store the mean baseline volatility for this M ratio
+                baseline_vol_by_m.loc[m, 'baseline_vol_mean'] = valid_vols.mean()
+                baseline_vol_by_m.loc[m, 'count'] = len(valid_vols)
+                print(f"M ratio {m}: baseline_vol_mean = {valid_vols.mean():.6f}, count = {len(valid_vols)}")
+            else:
+                print(f"Warning: No valid baseline volatility data for M ratio {m}")
+                baseline_vol_by_m.loc[m, 'baseline_vol_mean'] = np.nan
+                baseline_vol_by_m.loc[m, 'count'] = 0
+        else:
+            print(f"Warning: 'baseline_vol' column not found in data for M ratio {m}")
+            baseline_vol_by_m.loc[m, 'baseline_vol_mean'] = np.nan
+            baseline_vol_by_m.loc[m, 'count'] = 0
+    
+    # For each M and D* combination, calculate volatility differences
+    for m in m_ratio_values:
+        for d_star in d_star_values:
+            # Filter data for this specific M and D* combination
+            combo_data = results_df[(results_df['M'] == m) & (results_df['d_value'] == d_star)]
+            
+            # Calculate volatility difference for this combination
+            if not combo_data.empty and 'vol_diff_bp' in combo_data.columns:
+                valid_diffs = combo_data['vol_diff_bp'].dropna()
+                if not valid_diffs.empty:
+                    vol_diff_table.loc[m, d_star] = valid_diffs.mean()
+                    count_table.loc[m, d_star] = len(valid_diffs)
+    
+    # Create a single complete table with two views
+    
+    # 1. Table with baseline volatility and raw vol difference values 
+    # (showing augmented-baseline, where negative means better)
+    raw_table = pd.DataFrame(index=m_ratio_values)
+    raw_table['baseline_volatility_raw'] = baseline_vol_by_m['baseline_vol_mean'].round(6)
+    raw_table['baseline_count'] = baseline_vol_by_m['count'].astype(int)
+    
+    # Add all D* columns with raw vol_diff_table values
+    for d_star in d_star_values:
+        raw_table[f'D*={d_star:.2f}'] = vol_diff_table[d_star].round(2)
+    
+    # 2. Table with baseline volatility (in bps) and negated vol differences 
+    # (showing baseline-augmented, where positive means better)
+    final_table = pd.DataFrame(index=m_ratio_values)
+    final_table['baseline_volatility_bps'] = (baseline_vol_by_m['baseline_vol_mean'] * 10000).round(2)
+    final_table['baseline_count'] = baseline_vol_by_m['count'].astype(int)
+    
+    # Add all D* columns with NEGATIVE vol_diff_table to get baseline-augmented
+    for d_star in d_star_values:
+        final_table[f'D*={d_star:.2f}'] = (-vol_diff_table[d_star]).round(2)
+    
+    # Save both tables
+    raw_output_filepath = os.path.join(output_folder, "table4_augmented_minus_baseline_raw.csv")
+    safe_save_csv(raw_table, raw_output_filepath)
+    
+    final_output_filepath = os.path.join(output_folder, "table4_baseline_minus_augmented.csv")
+    safe_save_csv(final_table, final_output_filepath)
+    
+    print(f"Table 4 (augmented-baseline, raw values) saved to {raw_output_filepath}")
+    print(f"Table 4 (baseline-augmented, positive=improvement) saved to {final_output_filepath}")
+    
+    # Also save table with count information for reference
+    count_output = os.path.join(table4_folder, "table4_count.csv")
+    safe_save_csv(count_table, count_output)
+    
+    # Save baseline volatility table for reference
+    baseline_output = os.path.join(table4_folder, "baseline_volatility.csv")
+    safe_save_csv(baseline_vol_by_m, baseline_output)
+    
+    return raw_table, final_table
+
+def generate_return_table_4_from_results(results_df: pd.DataFrame, output_folder: str):
+    """
+    Generate Table 4 equivalent for annualized return differences.
+    Shows return difference between low-dim and high-dim estimation (in basis points).
+    
+    Parameters:
+    - results_df: DataFrame containing evaluation results
+    - output_folder: Folder to save the return tables
+    """
+    if results_df.empty:
+        print("No results available to generate Return Table 4")
+        return
+    
+    # Create output folder for return tables
+    return_table_folder = os.path.join(output_folder, "table4_returns")
+    try:
+        os.makedirs(return_table_folder, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Could not create Return Table 4 folder: {e}")
+        return_table_folder = output_folder
+    
+    # Get all D* values and M values from results
+    d_star_values = sorted(results_df['d_value'].unique())
+    m_ratio_values = sorted(results_df['M'].unique())
+    
+    # Create tables for return differences (in basis points)
+    return_table_4_mean = pd.DataFrame(0.0, index=m_ratio_values, columns=d_star_values, dtype=float)
+    return_table_4_median = pd.DataFrame(0.0, index=m_ratio_values, columns=d_star_values, dtype=float)
+    return_count_table = pd.DataFrame(0, index=m_ratio_values, columns=d_star_values, dtype=int)
+    
+    # Calculate return differences for each M and D* combination
+    for m in m_ratio_values:
+        for d_star in d_star_values:
+            # Filter results for this M and D* combination
+            subset = results_df[
+                (results_df['M'] == m) & 
+                (results_df['d_value'] == d_star)
+            ]
+            
+            # Calculate return difference using return_diff_bp column if available
+            if not subset.empty and 'return_diff_bp' in subset.columns:
+                valid_diffs = subset['return_diff_bp'].dropna()
+                
+                if not valid_diffs.empty:
+                    mean_diff = valid_diffs.mean()
+                    median_diff = valid_diffs.median()
+                    count = len(valid_diffs)
+                    
+                    return_table_4_mean.loc[m, d_star] = float(mean_diff)
+                    return_table_4_median.loc[m, d_star] = float(median_diff)
+                    return_count_table.loc[m, d_star] = int(count)
+    
+    # Round for better readability
+    return_table_4_mean_rounded = return_table_4_mean.round(2)
+    return_table_4_median_rounded = return_table_4_median.round(2)
+    
+    # Save tables
+    try:
+        safe_save_csv(return_table_4_mean_rounded, os.path.join(return_table_folder, "table4_returns_mean.csv"))
+        safe_save_csv(return_table_4_median_rounded, os.path.join(return_table_folder, "table4_returns_median.csv"))
+        safe_save_csv(return_count_table, os.path.join(return_table_folder, "table4_returns_count.csv"))
+    except Exception as e:
+        print(f"Warning: Could not save Return Table 4 CSV files: {e}")
+    
+    # Create heatmap visualization for return differences
+    try:
+        plt.figure(figsize=(12, 8))
+        
+        # Use median values for more robust visualization
+        sns.heatmap(return_table_4_median, annot=True, cmap='RdBu', center=0, 
+                   fmt='.1f', linewidths=0.5, cbar_kws={'label': 'Return Difference (bp)'})
+        plt.title('Median Return Difference (bp) by D* Value and Missing Ratio M')
+        plt.xlabel('D* Value')
+        plt.ylabel('Missing Data Ratio (M)')
+        plt.tight_layout()
+        
+        try:
+            plt.savefig(os.path.join(return_table_folder, "heatmap_return_diff_by_d_star_m.png"), dpi=300)
+        except Exception as e:
+            print(f"Warning: Could not save return heatmap: {e}")
+        
+        plt.close()
+    except Exception as e:
+        print(f"Error creating return heatmap: {e}")
+    
+    print(f"Return Table 4 generated and saved to {return_table_folder}")
+
+def generate_sharpe_table_4_from_results(results_df: pd.DataFrame, output_folder: str):
+    """
+    Generate Table 4 equivalent for Sharpe ratio differences.
+    Shows risk-adjusted return difference between low-dim and high-dim estimation.
+    
+    Parameters:
+    - results_df: DataFrame containing evaluation results
+    - output_folder: Folder to save the Sharpe ratio tables
+    """
+    if results_df.empty:
+        print("No results available to generate Sharpe Table 4")
+        return
+    
+    # Create output folder
+    sharpe_table_folder = os.path.join(output_folder, "table4_sharpe")
+    try:
+        os.makedirs(sharpe_table_folder, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Could not create Sharpe Table 4 folder: {e}")
+        sharpe_table_folder = output_folder
+    
+    # Get all D* values and M values from results
+    d_star_values = sorted(results_df['d_value'].unique())
+    m_ratio_values = sorted(results_df['M'].unique())
+    
+    # Create tables for Sharpe ratio differences
+    sharpe_table_4_mean = pd.DataFrame(0.0, index=m_ratio_values, columns=d_star_values, dtype=float)
+    sharpe_table_4_median = pd.DataFrame(0.0, index=m_ratio_values, columns=d_star_values, dtype=float)
+    sharpe_count_table = pd.DataFrame(0, index=m_ratio_values, columns=d_star_values, dtype=int)
+    
+    # Calculate Sharpe ratio differences for each M and D* combination
+    for m in m_ratio_values:
+        for d_star in d_star_values:
+            # Filter results for this M and D* combination
+            subset = results_df[
+                (results_df['M'] == m) & 
+                (results_df['d_value'] == d_star)
+            ]
+            
+            # Calculate Sharpe ratio difference
+            if not subset.empty and 'sharpe_diff' in subset.columns:
+                valid_diffs = subset['sharpe_diff'].dropna()
+                
+                if not valid_diffs.empty:
+                    mean_diff = valid_diffs.mean()
+                    median_diff = valid_diffs.median()
+                    count = len(valid_diffs)
+                    
+                    sharpe_table_4_mean.loc[m, d_star] = float(mean_diff)
+                    sharpe_table_4_median.loc[m, d_star] = float(median_diff)
+                    sharpe_count_table.loc[m, d_star] = int(count)
+    
+    # Round for better readability
+    sharpe_table_4_mean_rounded = sharpe_table_4_mean.round(4)
+    sharpe_table_4_median_rounded = sharpe_table_4_median.round(4)
+    
+    # Save tables
+    try:
+        safe_save_csv(sharpe_table_4_mean_rounded, os.path.join(sharpe_table_folder, "table4_sharpe_mean.csv"))
+        safe_save_csv(sharpe_table_4_median_rounded, os.path.join(sharpe_table_folder, "table4_sharpe_median.csv"))
+        safe_save_csv(sharpe_count_table, os.path.join(sharpe_table_folder, "table4_sharpe_count.csv"))
+    except Exception as e:
+        print(f"Warning: Could not save Sharpe Table 4 CSV files: {e}")
+    
+    # Create heatmap visualization for Sharpe ratio differences
+    try:
+        plt.figure(figsize=(12, 8))
+        
+        # Use median values for more robust visualization
+        sns.heatmap(sharpe_table_4_median, annot=True, cmap='RdBu', center=0, 
+                   fmt='.3f', linewidths=0.5, cbar_kws={'label': 'Sharpe Ratio Difference'})
+        plt.title('Median Sharpe Ratio Difference by D* Value and Missing Ratio M')
+        plt.xlabel('D* Value')
+        plt.ylabel('Missing Data Ratio (M)')
+        plt.tight_layout()
+        
+        try:
+            plt.savefig(os.path.join(sharpe_table_folder, "heatmap_sharpe_diff_by_d_star_m.png"), dpi=300)
+        except Exception as e:
+            print(f"Warning: Could not save Sharpe heatmap: {e}")
+        
+        plt.close()
+    except Exception as e:
+        print(f"Error creating Sharpe heatmap: {e}")
+    
+    print(f"Sharpe Table 4 generated and saved to {sharpe_table_folder}")
+
+def generate_max_drawdown_table_4_from_results(results_df: pd.DataFrame, output_folder: str):
+    """Generate Table 4 equivalent for maximum drawdown differences."""
+    if results_df.empty:
+        print("No results available to generate Maximum Drawdown Table 4")
+        return
+    
+    # Create output folder
+    drawdown_table_folder = os.path.join(output_folder, "table4_max_drawdown")
+    try:
+        os.makedirs(drawdown_table_folder, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Could not create Max Drawdown Table 4 folder: {e}")
+        drawdown_table_folder = output_folder
+    
+    # Get all D* values and M values from results
+    d_star_values = sorted(results_df['d_value'].unique())
+    m_ratio_values = sorted(results_df['M'].unique())
+    
+    # Create tables for max drawdown differences (in percentage points)
+    drawdown_table_4_mean = pd.DataFrame(0.0, index=m_ratio_values, columns=d_star_values, dtype=float)
+    drawdown_table_4_median = pd.DataFrame(0.0, index=m_ratio_values, columns=d_star_values, dtype=float)
+    drawdown_count_table = pd.DataFrame(0, index=m_ratio_values, columns=d_star_values, dtype=int)
+    
+    # Calculate max drawdown differences for each M and D* combination
+    for m in m_ratio_values:
+        for d_star in d_star_values:
+            subset = results_df[
+                (results_df['M'] == m) & 
+                (results_df['d_value'] == d_star)
+            ]
+            
+            if not subset.empty and 'max_drawdown_diff_pct' in subset.columns:
+                valid_diffs = subset['max_drawdown_diff_pct'].dropna()
+                
+                if not valid_diffs.empty:
+                    mean_diff = valid_diffs.mean()
+                    median_diff = valid_diffs.median()
+                    count = len(valid_diffs)
+                    
+                    drawdown_table_4_mean.loc[m, d_star] = float(mean_diff)
+                    drawdown_table_4_median.loc[m, d_star] = float(median_diff)
+                    drawdown_count_table.loc[m, d_star] = int(count)
+    
+    # Round and save
+    drawdown_table_4_mean_rounded = drawdown_table_4_mean.round(4)
+    drawdown_table_4_median_rounded = drawdown_table_4_median.round(4)
+    
+    try:
+        safe_save_csv(drawdown_table_4_mean_rounded, os.path.join(drawdown_table_folder, "table4_max_drawdown_mean.csv"))
+        safe_save_csv(drawdown_table_4_median_rounded, os.path.join(drawdown_table_folder, "table4_max_drawdown_median.csv"))
+        safe_save_csv(drawdown_count_table, os.path.join(drawdown_table_folder, "table4_max_drawdown_count.csv"))
+    except Exception as e:
+        print(f"Warning: Could not save Max Drawdown Table 4 CSV files: {e}")
+    
+    # Create heatmap
+    try:
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(drawdown_table_4_median, annot=True, cmap='RdBu', center=0, 
+                   fmt='.1f', linewidths=0.5, cbar_kws={'label': 'Max Drawdown Difference (pp)'})
+        plt.title('Median Max Drawdown Difference (pp) by D* Value and Missing Ratio M')
+        plt.xlabel('D* Value')
+        plt.ylabel('Missing Data Ratio (M)')
+        plt.tight_layout()
+        
+        try:
+            plt.savefig(os.path.join(drawdown_table_folder, "heatmap_max_drawdown_diff_by_d_star_m.png"), dpi=300)
+        except Exception as e:
+            print(f"Warning: Could not save max drawdown heatmap: {e}")
+        plt.close()
+    except Exception as e:
+        print(f"Error creating max drawdown heatmap: {e}")
+    
+    print(f"Max Drawdown Table 4 generated and saved to {drawdown_table_folder}")
+
+def analyze_method_by_d_value(results_df: pd.DataFrame, base_folder: str):
+    """
+    Analyze and visualize method performance across different D values.
+    
+    Parameters:
+    - results_df: DataFrame of evaluation results
+    - base_folder: Base folder to save results
+    """
+    # Bail out if no results
+    if results_df is None or results_df.empty:
+        logging.error("No D* evaluation results – aborting detailed analysis.")
+        sys.exit(1)
+
+    # Create output folder
+    d_value_folder = Path(base_folder) / "by_d_value"
+    d_value_folder.mkdir(parents=True, exist_ok=True)
+    
+    # Group by asset size for analysis
+    for num_assets in results_df['num_assets'].unique():
+        asset_df = results_df[results_df['num_assets'] == num_assets]
+        
+        # Create summary tables and plots for each metric
+        metrics = ['sharpe_ratio', 'risk', 'annualized_return', 'max_drawdown']
+        for metric in metrics:
+            # Pivot table: methods vs D values
+            pivot = asset_df.pivot_table(
+                index='method',
+                columns='d_value',
+                values=metric,
+                aggfunc='mean'
+            )
+            
+            # Save pivot table
+            output_file = d_value_folder / f"assets_{num_assets}_{metric}_by_d_value_D{d_star_values:.1f}_M{m_ratio_values:.2f}.csv"
+            pivot.to_csv(output_file)
+            
+            # Plot
+            plt.figure(figsize=(12, 8))
+            for method in pivot.index:
+                plt.plot(
+                    pivot.columns,
+                    pivot.loc[method],
+                    marker='o',
+                    label=method,
+                    linewidth=2
+                )
+            plt.xlabel('D Value')
+            plt.ylabel(metric.replace('_', ' ').title())
+            plt.title(f"{metric.replace('_', ' ').title()} by D Value (Assets: {num_assets})")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.savefig(d_value_folder / f"assets_{num_assets}_{metric}_by_d_value.png", dpi=300)
+            plt.close()
+        
+        # Create best performer table for each D value
+        best_performers = pd.DataFrame()
+        for d_value in sorted(asset_df['d_value'].unique()):
+            subset = asset_df[asset_df['d_value'] == d_value]
+            best_row = {'d_value': d_value}
+            for metric in metrics:
+                # determine sorting order
+                ascending = metric not in ['sharpe_ratio', 'annualized_return']
+                # find best method
+                agg = subset.groupby('method')[metric].mean().reset_index()
+                agg_sorted = agg.sort_values(by=metric, ascending=ascending)
+                best_row[f"best_{metric}_method"] = agg_sorted.iloc[0]['method']
+                best_row[f"best_{metric}_value"] = agg_sorted.iloc[0][metric]
+            best_performers = pd.concat(
+                [best_performers, pd.DataFrame([best_row])],
+                ignore_index=True
+            )
+        # Save best performers table
+            best_performers.to_csv(d_value_folder / f"assets_{num_assets}_best_performers_D{d_star_values:.1f}_M{m_ratio_values:.2f}.csv")
+    
+    print(f"Method performance by D value analysis saved to {d_value_folder}")
+
+# Function to analyze method performance by asset count
+def analyze_method_by_asset_count(results_df: pd.DataFrame, base_folder: str):
+    """
+    Analyze and visualize method performance across different asset counts.
+    
+    Parameters:
+    - results_df: DataFrame of evaluation results
+    - base_folder: Base folder to save results
+    """
+    # Create output folder
+    asset_folder = Path(base_folder) / "by_asset_count"
+    asset_folder.mkdir(parents=True, exist_ok=True)
+    
+    # Group by D value for analysis
+    for d_value in results_df['d_value'].unique():
+        d_df = results_df[results_df['d_value'] == d_value]
+        
+        # Create summary tables for each metric
+        for metric in ['sharpe_ratio', 'risk', 'annualized_return', 'max_drawdown']:
+            # Pivot table: methods vs asset counts
+            pivot = d_df.pivot_table(
+                index='method',
+                columns='num_assets',
+                values=metric,
+                aggfunc='mean'
+            )
+            
+            # Save pivot table
+            output_file = asset_folder / f"d_{d_value}_{metric}_by_asset_count.csv"
+            pivot.to_csv(output_file)
+            
+            # Create visualization
+            plt.figure(figsize=(10, 7))
+            
+            # Line plot for each method across asset counts
+            for method in pivot.index:
+                plt.plot(
+                    pivot.columns, 
+                    pivot.loc[method], 
+                    marker='o', 
+                    label=method,
+                    linewidth=2
+                )
+            
+            plt.xlabel('Number of Assets')
+            metric_label = metric.replace('_', ' ').title()
+            plt.ylabel(metric_label)
+            plt.title(f'{metric_label} by Asset Count (D: {d_value})')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            
+            # Save visualization
+            plt.savefig(asset_folder / f"d_{d_value}_{metric}_by_asset_count.png", dpi=300)
+            plt.close()
+        
+        # Create method scalability table
+        scalability = pd.DataFrame()
+        
+        for method in d_df['method'].unique():
+            method_df = d_df[d_df['method'] == method]
+            
+            # Calculate metrics for each asset size
+            for metric in ['sharpe_ratio', 'risk', 'annualized_return', 'max_drawdown']:
+                avg_by_asset = method_df.groupby('num_assets')[metric].mean()
+                
+                # Calculate trend across asset sizes (simple linear regression)
+                x = np.array(avg_by_asset.index)
+                y = avg_by_asset.values
+                
+                if len(x) >= 2:  # Need at least 2 points for trend
+                    slope = np.polyfit(x, y, 1)[0]
+                    
+                    # Determine if trend is beneficial
+                    if metric in ['sharpe_ratio', 'annualized_return']:
+                        # Higher is better, positive slope is good
+                        quality = "improves" if slope > 0 else "worsens"
+                    else:
+                        # Lower is better, negative slope is good
+                        quality = "improves" if slope < 0 else "worsens"
+                    
+                    row = {
+                        'method': method,
+                        'metric': metric,
+                        'trend_slope': slope,
+                        'trend_quality': quality,
+                        'asset_100': avg_by_asset.get(100, np.nan),
+                        'asset_200': avg_by_asset.get(200, np.nan),
+                        'asset_300': avg_by_asset.get(300, np.nan)
+                    }
+                    
+                    scalability = pd.concat([scalability, pd.DataFrame([row])], ignore_index=True)
+        
+        # Save scalability analysis
+        scalability.to_csv(asset_folder / f"d_{d_value}_method_scalability.csv", index=False)
+    
+    print(f"Method performance by asset count analysis saved to {asset_folder}")
+
+# Function to generate more detailed visualizations of D* performance by method
+def visualize_d_star_performance_by_method(results_df, output_folder):
+    """
+    Generate detailed visualizations of D* performance by covariance method.
+    
+    Parameters:
+    - results_df: DataFrame with results from evaluate_multiple_rounds_with_d_values
+    - output_folder: Folder to save the visualizations
+    """
+    if results_df.empty:
+        print("No results to visualize")
+        return
+        
+    # Create output folder
+    viz_folder = os.path.join(output_folder, "d_star_visualizations")
+    os.makedirs(viz_folder, exist_ok=True)
+    
+    # Get unique methods and D* values
+    methods = results_df['method'].unique()
+    d_values = sorted(results_df['d_value'].unique())
+    
+    # Colors for methods
+    colors = {
+        'Sample': 'blue',
+        'LShri': 'orange',
+        'LShriCC': 'green',
+        'DK': 'red',
+        'POET': 'purple',
+        'BPSEst': 'brown',
+        'QIS': 'magenta',
+        '1/N': 'black'
+    }
+    
+    # 1. Box plot of volatility difference by D* for each method
+    plt.figure(figsize=(15, 8))
+    
+    # Create data for box plot
+    boxplot_data = []
+    box_labels = []
+    
+    for method in methods:
+        for d_value in d_values:
+            method_d_data = results_df[(results_df['method'] == method) & 
+                                      (results_df['d_value'] == d_value)]['vol_diff_bp'].dropna()
+            
+            if len(method_d_data) > 0:
+                boxplot_data.append(method_d_data)
+                box_labels.append(f"{method}\nD*={d_value}")
+    
+    # Create box plot
+    bp = plt.boxplot(boxplot_data, patch_artist=True, labels=box_labels)
+    
+    # Color the boxes by method
+    for i, box in enumerate(bp['boxes']):
+        method = box_labels[i].split('\n')[0]
+        box.set(facecolor=colors.get(method, 'gray'), alpha=0.7)
+    
+    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    plt.xticks(rotation=90)
+    plt.ylabel('Volatility Difference (bp)')
+    plt.title('Distribution of Volatility Differences by Method and D* Value')
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(viz_folder, "vol_diff_boxplot.png"), dpi=300)
+    plt.close()
+    
+    # 2. Line plot of average volatility difference by D* for each method
+    plt.figure(figsize=(12, 6))
+    
+    # Group by method and D*
+    grouped = results_df.groupby(['method', 'd_value'])['vol_diff_bp'].agg(['mean', 'std']).reset_index()
+    
+    for method in methods:
+        method_data = grouped[grouped['method'] == method]
+        if not method_data.empty:
+            plt.errorbar(method_data['d_value'], method_data['mean'], 
+                       yerr=method_data['std'], 
+                       label=method, 
+                       marker='o',
+                       color=colors.get(method, 'gray'),
+                       capsize=5, 
+                       linewidth=2)
+    
+    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    plt.xlabel('D* Value')
+    plt.ylabel('Average Volatility Difference (bp)')
+    plt.title('Average Volatility Difference by D* Value for Each Method')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(viz_folder, "vol_diff_by_method.png"), dpi=300)
+    plt.close()
+    
+    # 3. Heatmap of D* performance by method
+    plt.figure(figsize=(12, 8))
+    
+    # Create pivot table for heatmap
+    heatmap_data = results_df.pivot_table(
+        values='vol_diff_bp',
+        index='method',
+        columns='d_value',
+        aggfunc='mean'
+    )
+    
+    # Plot heatmap
+    sns.heatmap(heatmap_data, annot=True, cmap='RdBu_r', center=0, fmt='.1f', linewidths=.5)
+    plt.title('Average Volatility Difference (bp) by Method and D* Value')
+    plt.ylabel('Method')
+    plt.xlabel('D* Value')
+    plt.tight_layout()
+    plt.savefig(os.path.join(viz_folder, "vol_diff_heatmap.png"), dpi=300)
+    plt.close()
+    
+    # 4. Find best D* value for each method
+    best_d_by_method = grouped.loc[grouped.groupby('method')['mean'].idxmin()]
+    
+    # Create bar chart of best D* by method
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(best_d_by_method['method'], best_d_by_method['d_value'], 
+                 color=[colors.get(m, 'gray') for m in best_d_by_method['method']])
+    
+    # Add value labels
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.1f}', ha='center', va='bottom')
+    
+    plt.xlabel('Covariance Method')
+    plt.ylabel('Best D* Value')
+    plt.title('Optimal D* Value by Covariance Method')
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(viz_folder, "best_d_star_by_method.png"), dpi=300)
+    plt.close()
+    
+    # 5. Create detailed summary table
+    summary_table = pd.DataFrame()
+    
+    for method in methods:
+        method_data = grouped[grouped['method'] == method]
+        if not method_data.empty:
+            best_d = method_data.loc[method_data['mean'].idxmin()]
+            worst_d = method_data.loc[method_data['mean'].idxmax()]
+            
+            summary = pd.DataFrame({
+                'method': [method],
+                'best_d_star': [best_d['d_value']],
+                'best_vol_diff': [best_d['mean']],
+                'worst_d_star': [worst_d['d_value']],
+                'worst_vol_diff': [worst_d['mean']],
+                'avg_vol_diff': [method_data['mean'].mean()],
+                'std_vol_diff': [method_data['mean'].std()]
+            })
+            
+            summary_table = pd.concat([summary_table, summary], ignore_index=True)
+    
+    # Sort by best volatility difference
+    summary_table = summary_table.sort_values('best_vol_diff')
+    
+    # Save summary table
+    summary_table.to_csv(os.path.join(viz_folder, "d_star_method_summary.csv"), index=False)
+    
+    print(f"D* performance visualizations saved to {viz_folder}")
+    return summary_table
+
+##### Main execution script with the analysis workflow #####
+
+def analyze_multiple_d_star_values(
+    file_path: str,
+    output_folder: str = None,
+    d_star_values: list = None,
+    num_rounds: int = 10,
+    num_assets: int = 100, # Number of assets to select from 100, 200, 300. Mentioned as int to check results after every evaluation
+    base_d: float = 0.5, # or 1.5 
+    cov_methods: list = None
+):
+    """
+    Run analysis across multiple D* values with improved numerical stability and error handling.
+    
+    Parameters:
+    - file_path: Path to CSV file with returns data
+    - output_folder: Folder to save results 
+    - d_star_values: List of D* values to test
+    - num_rounds: Number of simulation rounds per D* value
+    - num_assets: Number of assets to use
+    - base_d: Base dimension ratio (fixed at 0.5/1.5 in paper)
+    - cov_methods: Covariance methods to test
+    
+    Returns:
+    - DataFrame with results for each D* value
+    - Best D* value based on volatility difference
+    """
+    # Set default values
+    if d_star_values is None:
+        # Avoid D* values too close to 1.0 which cause numerical instability
+        d_star_values = [0.95, 1.05, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.5, 3.0, 4.0, 5.0]
+        # [1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.75, 3.0, 3.5, 4.0, 5.0] when baseline D is 1.5
+    
+    if cov_methods is None:
+        cov_methods = ['QIS']  # Focus on QIS as in Table 4
+    
+    # Define M values but avoid exactly 0.5 which causes extreme values
+    m_ratio_values = [0, 0.01, 0.02, 0.03, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+    
+    if output_folder is None:
+        # Create a unique timestamped folder to avoid permission conflicts
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_folder = os.path.join(os.path.expanduser("~"), "Documents", f"sp500_analysis_{timestamp}")
+    
+    # Create output folder with proper error handling
+    try:
+        os.makedirs(output_folder, exist_ok=True)
+        print(f"Results will be saved to: {output_folder}")
+    except Exception as e:
+        print(f"Warning: Could not create output folder: {e}")
+        # Use a fallback location that should work
+        from tempfile import gettempdir
+        output_folder = os.path.join(gettempdir(), f"sp500_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+            print(f"Using alternative output folder: {output_folder}")
+        except Exception as e2:
+            print(f"Critical error: Could not create temp folder: {e2}")
+            # Last resort - use current directory
+            output_folder = "."
+            print("Using current directory for output")
+    
+    try:
+        # Run evaluation with improved numerically stable implementation
+        results_df = evaluate_multiple_rounds_with_d_values(
+            num_rounds=num_rounds,
+            base_folder=output_folder,
+            file_path=file_path,
+            d_star_values=d_star_values,
+            m_ratio_values=m_ratio_values,
+            num_assets=num_assets,
+            cov_methods=cov_methods
+        )
+    except Exception as e:
+        print(f"Error in evaluation: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame(), pd.DataFrame()
+    
+    if results_df.empty:
+        print("No valid results were generated. Check error messages.")
+        return pd.DataFrame(), pd.DataFrame()
+    
+    # Use vol_diff_bp for consistency with paper, but be careful of outliers
+    # Find best D* value by M using median (more robust than mean)
+    best_d_by_m = pd.DataFrame(columns=['M', 'best_d_star', 'vol_diff_bp'])
+    
+    for m in m_ratio_values:
+        m_data = results_df[results_df['M'] == m]
+        if not m_data.empty:
+            # Group by d_value and use median for robustness
+            avg_by_d = m_data.groupby('d_value')['vol_diff_bp'].median()
+            
+            if not avg_by_d.empty:
+                best_d = avg_by_d.idxmin()
+                best_val = avg_by_d.min()
+                
+                # Fixed DataFrame concatenation warning
+                new_row = pd.DataFrame({'M': [m], 'best_d_star': [best_d], 'vol_diff_bp': [best_val]})
+                if best_d_by_m.empty:
+                    best_d_by_m = new_row
+                else:
+                    best_d_by_m = pd.concat([best_d_by_m, new_row], ignore_index=True)
+    
+    # Save best D* by M with error handling
+    try:
+        safe_save_csv(best_d_by_m, os.path.join(output_folder, "best_d_star_by_m.csv"))
+    except Exception as e:
+        print(f"Warning: Could not save best D* values: {e}")
+    
+    # Generate Table 4 formatted output with error handling
+    try:
+        generate_robust_table_4_from_results(results_df, output_folder)
+        generate_return_table_4_from_results(results_df, output_folder)
+        generate_sharpe_table_4_from_results(results_df, output_folder)
+        generate_max_drawdown_table_4_from_results(results_df, output_folder)  # ADD THIS LINE
+    except Exception as e:
+        print(f"Error generating Table 4: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Create visualization of optimal D* by M ratio with error handling
+    try:
+        plt.figure(figsize=(10, 6))
+        plt.scatter(best_d_by_m['M'], best_d_by_m['best_d_star'], s=80)
+        plt.plot(best_d_by_m['M'], best_d_by_m['best_d_star'], linewidth=2)
+        
+        # Add regression line
+        if len(best_d_by_m) > 2:
+            try:
+                from scipy import stats
+                
+                # Fixed regression calculation using numpy arrays
+                slope, intercept, r_value, p_value, std_err = stats.linregress(
+                    best_d_by_m['M'].values.astype(float), 
+                    best_d_by_m['best_d_star'].values.astype(float)
+                )
+                
+                # Plot regression line
+                x_reg = np.array([min(best_d_by_m['M']), max(best_d_by_m['M'])])
+                y_reg = intercept + slope * x_reg
+                plt.plot(x_reg, y_reg, 'r--', 
+                        label=f'Regression: D* = {intercept:.2f} + ({slope:.2f} × M), R²={r_value**2:.2f}')
+                plt.legend()
+            except Exception as e:
+                print(f"Warning: Could not calculate regression: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        plt.xlabel('Missing Data Ratio (M)')
+        plt.ylabel('Optimal D* Value')
+        plt.title('Optimal D* Value by Missing Data Ratio')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        try:
+            plt.savefig(os.path.join(output_folder, "optimal_d_star_by_m.png"), dpi=300)
+        except Exception as e:
+            print(f"Warning: Could not save D* plot: {e}")
+            
+        plt.close()
+    except Exception as e:
+        print(f"Error creating D* plot: {e}")
+    
+    print("Analysis complete. Results saved to:", output_folder)
+    
+    # Return results
+    return results_df, best_d_by_m
+
+def safe_save_csv(df, filepath):
+    """
+    Safely save a DataFrame to CSV, handling permission errors gracefully.
+    
+    Parameters:
+    - df: DataFrame to save
+    - filepath: Path to save the CSV
+    
+    Returns:
+    - True if saved successfully, False otherwise
+    """
+    try:
+        # Try the direct save first
+        df.to_csv(filepath,
+              index=True,         # keep the M-ratio column
+              index_label='M')    # name that column “M” in the CSV
+        return True
+    except PermissionError:
+        # If permission denied, try with an alternative filename
+        try:
+            dir_path = os.path.dirname(filepath)
+            filename = os.path.basename(filepath)
+            base, ext = os.path.splitext(filename)
+            alt_filepath = os.path.join(dir_path, f"{base}_new{ext}")
+            
+            print(f"Permission denied on {filepath}, trying {alt_filepath}")
+            df.to_csv(alt_filepath, index=False)
+            return True
+        except Exception as e:
+            print(f"Failed to save to alternative path: {e}")
+            return False
+    except Exception as e:
+        print(f"Error saving CSV: {e}")
+        return False
+
+def predict_optimal_d_star(D, M, market='EU'):
+    """
+    Predict optimal D* using the regression model from Table 13 in the paper.
+    
+    Parameters:
+    - D: Original dimension ratio
+    - M: Ratio of assets with missing data
+    - market: Market data ('US', 'EU', or 'WO')
+    
+    Returns:
+    - Predicted optimal D*
+    """
+    # Coefficients from Table 13 - these alpha and beta values are 
+    # specifically for the D* prediction regression model
+    if market == 'US':
+        alpha = 0.9806
+        beta_D = 2.3882
+        beta_M = -1.1712
+    elif market == 'EU':
+        alpha = 0.8863
+        beta_D = 2.4369
+        beta_M = -1.8655
+    else:  # WO
+        alpha = 0.8239
+        beta_D = 2.3996
+        beta_M = -1.7121
+    
+    # Apply the regression formula from Equation 34
+    D_star = alpha + beta_D * D + beta_M * M
+    
+    # Ensure D* ≥ D and D* isn't too close to 1 (to avoid singularity issues)
+    if 0.9 < D_star < 1.1:
+        D_star = 1.1  # Avoid singularity around D* = 1
+    
+    D_star = max(D, D_star)  # Ensure we're adding data, not removing it
+    
+    return D_star
+
+if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, 
+                       format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    try:
+        # Import necessary for PermissionError handling
+        import os
+        from datetime import datetime
+        import traceback
+        
+        # Paths and parameters
+        file_path = r"C:\Users\Sraavya\Downloads\SP500_2000_2024.csv"
+        
+        # Create a unique timestamp folder to avoid conflicts
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_folder = os.path.join(os.path.expanduser("~"), "Documents", f"sp500_analysis_{timestamp}")
+        
+        # Make sure temp folder exists
+        try:
+            os.makedirs(base_folder, exist_ok=True)
+            print(f"Analysis results will be saved to: {base_folder}")
+        except Exception as e:
+            print(f"Warning: Could not create output folder: {e}")
+            # Try a different location
+            from tempfile import gettempdir
+            base_folder = os.path.join(gettempdir(), f"sp500_analysis_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+            print(f"Using temporary directory: {base_folder}")
+        
+        # Use D* values that avoid the problematic region around 1.0
+        d_star_values = [0.95, 1.05, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.5, 3.0, 4.0, 5.0]
+        # [1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.75, 3.0, 3.5, 4.0, 5.0], when baseline D is 1.5
+        
+        # Use missing data ratios that avoid exactly 0.5
+        m_ratio_values = [0, 0.01, 0.02, 0.03, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+        
+        # Focus on QIS method as in the paper
+        cov_methods = ['QIS']
+        
+        # Set a random seed for reproducibility
+        np.random.seed(42)
+        
+        # First verify the file exists
+        if not os.path.exists(file_path):
+            print(f"Error: Input file not found at {file_path}")
+            # Try to find an alternative location
+            alt_path = os.path.join(os.path.dirname(__file__), "SP500_2000_2024.csv")
+            if os.path.exists(alt_path):
+                file_path = alt_path
+                print(f"Using alternative file path: {file_path}")
+            else:
+                # Prompt user for file path
+                file_path = input("Please enter the full path to the SP500 CSV file: ")
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(f"File not found: {file_path}")
+        
+        # Run the evaluation with numerically stable method
+        logging.info("Running evaluation with numerically stable methods...")
+        results_df, best_d_by_m = analyze_multiple_d_star_values(
+            file_path=file_path,
+            output_folder=base_folder,
+            d_star_values=d_star_values,
+            num_rounds=10,  
+            num_assets=100, # Number of assets to select from 100, 200, 300. Mentioned as int to check results after every evaluation
+            cov_methods=cov_methods
+        )
+        
+        # Print results
+        if not best_d_by_m.empty:
+            logging.info("\nBest D* Values by Missing Data Ratio:")
+            print(best_d_by_m)
+            
+            # Predict optimal D* for common M values using regression
+            if len(best_d_by_m) > 2:
+                try:
+                    from scipy import stats
+                    # Fix for regression error - convert to numpy arrays
+                    slope, intercept, r_value, p_value, std_err = stats.linregress(
+                        best_d_by_m['M'].values.astype(float), 
+                        best_d_by_m['best_d_star'].values.astype(float)
+                    )
+                    
+                    print("\nPrediction formula for optimal D*:")
+                    print(f"D* = {intercept:.4f} + ({slope:.4f} × M)")
+                    print(f"R² = {r_value**2:.4f}, Standard Error = {std_err:.4f}")
+                    
+                    # Predict for common M values
+                    common_m = [0.05, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8]
+                    print("\nPredictions for common M values:")
+                    for m in common_m:
+                        predicted_d = intercept + slope * m
+                        print(f"M = {m:.2f} → Predicted optimal D* = {predicted_d:.2f}")
+                    
+                    # Create a simple summary file
+                    summary_path = os.path.join(base_folder, "prediction_summary.txt")
+                    try:
+                        with open(summary_path, 'w') as f:
+                            f.write(f"Prediction formula: D* = {intercept:.4f} + ({slope:.4f} × M)\n")
+                            f.write(f"R² = {r_value**2:.4f}, Standard Error = {std_err:.4f}\n\n")
+                            f.write("Predictions for common M values:\n")
+                            for m in common_m:
+                                predicted_d = intercept + slope * m
+                                f.write(f"M = {m:.2f} → Predicted optimal D* = {predicted_d:.2f}\n")
+                    except Exception as e:
+                        print(f"Could not save prediction summary: {e}")
+                        
+                except Exception as e:
+                    print(f"Error in regression analysis: {e}")
+                    traceback.print_exc()
+            
+            # Save the best D* values to a CSV file
+            generate_robust_table_4_from_results(results_df, "/mnt/data")
+
+            # Save a backup of the best_d_by_m DataFrame
+            try:
+                safe_save_csv(best_d_by_m, os.path.join(base_folder, "best_d_star_values_backup.csv"))
+                mean_df = pd.read_csv("/mnt/data/table4_final_mean.csv", index_col="M")
+                median_df = pd.read_csv("/mnt/data/table4_final_median.csv", index_col="M")
+            except Exception as e:
+                print(f"Could not save backup of best D* values: {e}")
+        else:
+            logging.warning("No best D* values were determined.")
+        
+        # Create and save summary of findings
+        try:
+            with open(os.path.join(base_folder, "analysis_summary.txt"), 'w') as f:
+                f.write("=== D* OPTIMIZATION ANALYSIS SUMMARY ===\n\n")
+                f.write(f"Analysis timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Input data: {file_path}\n")
+                f.write(f"D* values tested: {d_star_values}\n")
+                f.write(f"Missing data ratios tested: {d_star_values}\n")
+                f.write(f"Covariance methods: {cov_methods}\n")
+                num_rounds = 10  # Define the number of rounds explicitly
+                f.write(f"Number of rounds per test: {num_rounds}\n")
+            
+                if not best_d_by_m.empty:
+                    f.write("=== OPTIMAL D* VALUES ===\n\n")
+                    f.write("Missing Data Ratio (M) | Optimal D* | Volatility Diff (bp)\n")
+                    f.write("-" * 60 + "\n")
+                    
+                    for _, row in best_d_by_m.iterrows():
+                        f.write(f"{row['M']:.2f} | {row['best_d_star']:.2f} | {row['vol_diff_bp']:.2f}\n")
+                    
+                    if len(best_d_by_m) > 2:
+                        try:
+                            # Calculate regression for the report
+                            slope, intercept, r_value, _, std_err = stats.linregress(
+                                best_d_by_m['M'].values.astype(float), 
+                                best_d_by_m['best_d_star'].values.astype(float)
+                            )
+                            
+                            f.write("\n=== REGRESSION ANALYSIS ===\n\n")
+                            f.write(f"Optimal D* = {intercept:.4f} + {slope:.4f} × M\n")
+                            f.write(f"R² = {r_value**2:.4f}, Standard Error = {std_err:.4f}\n\n")
+                            
+                            # Example predictions
+                            f.write("Example Predictions:\n")
+                            for m in [0.1, 0.3, 0.5, 0.7, 0.9]:
+                                predicted_d = intercept + slope * m
+                                f.write(f"M = {m:.1f} → D* ≈ {predicted_d:.2f}\n")
+                        except:
+                            f.write("\nCould not calculate regression - not enough data points.\n")
+                
+        except Exception as e:
+            print(f"Could not generate analysis summary: {e}")
+            
+        print(f"\nAnalysis complete. Results saved to: {base_folder}")
+        
+    except Exception as e:
+        logging.error(f"Error in main program: {e}")
+        traceback.print_exc()
