@@ -1,0 +1,2 @@
+# Data-Augmentation-for-High-Dimensional-Covariance-Estimation-Master-s-Thesis-
+A scalable, estimator-agnostic data augmentation framework combining regression-based imputation, cross-validation, and transfer learning to reconstruct incomplete return histories. Applied to S&amp;P 500 portfolios, it improves out-of-sample volatility and drawdown across classical, shrinkage, and factor-based estimators.
